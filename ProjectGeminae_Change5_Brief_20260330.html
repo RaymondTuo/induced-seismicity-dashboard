@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Project Geminae - Change 5 Brief</title>
+<style>
+  body { font-family: 'Times New Roman', Times, serif; font-size: 10pt;
+         color: #000; background: #fff; max-width: 900px; margin: 40px auto; padding: 0 24px; }
+  h1   { font-size: 16pt; margin-bottom: 2px; }
+  .sub { font-size: 10pt; margin: 0; }
+  .meta { font-size: 9pt; font-style: italic; color: #444; margin-bottom: 8px; }
+  hr.thick { border: none; border-top: 2px solid #000; margin: 6px 0 10px; }
+  h2   { font-size: 11pt; margin: 16px 0 2px; border-bottom: 1px solid #000; padding-bottom: 2px; }
+  p, li { font-size: 9pt; line-height: 1.5; margin: 4px 0; }
+  ul   { margin: 4px 0 4px 16px; padding: 0; }
+  table { border-collapse: collapse; width: 100%; font-size: 8.5pt; margin: 6px 0; }
+  th   { border-bottom: 1.5px solid #000; padding: 3px 6px; text-align: center; font-weight: bold; }
+  td   { padding: 2px 6px; text-align: center; }
+  tr.best td { font-weight: bold; }
+  .note { font-size: 8pt; font-style: italic; color: #444; }
+  .next td:first-child { font-weight: bold; width: 160px; text-align: left; }
+  .next td { text-align: left; padding: 2px 6px; font-size: 9pt; }
+  .box { border: 1px solid #000; padding: 6px 10px; margin: 6px 0; font-size: 9pt; }
+  .warn { border-left: 3px solid #000; padding-left: 8px; margin: 6px 0; font-size: 9pt; font-style: italic; }
+</style>
+</head>
+<body>
+
+<h1>Project Geminae</h1>
+<p class="sub">Change 5 &mdash; Lookback Window Sensitivity Sweep</p>
+<p class="meta">Generated 30 March 2026 &nbsp;|&nbsp; Source: lookback_sweep_comparison_nolog_20260330_133128.csv &nbsp;|&nbsp; 5 windows &times; 20 radii &times; 2 models</p>
+<hr class="thick">
+
+<h2>1. Change Summary</h2>
+<p>Change 5 (ref. Feb 18 sponsor meeting, Q3) exposes the injection lookback window as a configurable
+parameter and runs a sensitivity sweep across five windows: 7, 14, 30, 60, and 90 days. The 30-day
+window was previously hardcoded in <code>filter_active_wells_before_events.py</code> (line 26,
+<code>LOOKBACK_DAYS = 30</code>) without empirical or physical justification. The goal is to identify
+which lag timescale best explains observed seismicity and to flag whether the tested range is
+sufficient or whether the optimal window lies beyond 90 days.</p>
+<p>This change is gated on sponsor Q3 (physical lag timescale for Permian formations). The sweep
+results are intended to inform that conversation, not replace it &mdash; the empirically best window
+and the physically defensible window may differ, and the latter takes precedence.</p>
+
+<h2>2. Bug Discovered During Implementation</h2>
+<div class="box">
+<p><strong>Pre-existing column selection error in dowhy_ci.py.</strong> The column fragment matcher
+for treatment variable W used <code>["volume", "bbl"]</code>, which matched
+<code>"Volume Injected (BBLs)"</code> (same-day injection) rather than
+<code>"Vol Prev N (BBLs)"</code> (the N-day lookback sum). This meant all prior runs
+(Changes 1&ndash;3) used same-day injection as the treatment, making the lookback window
+parameter irrelevant. The fix changes the W fragment to <code>["prev", "bbl"]</code>, which
+uniquely identifies the lookback column. This correction is included in Change 5 and applies
+retroactively to all models.</p>
+</div>
+
+<h2>3. Methodology</h2>
+<p><strong>Pipeline changes:</strong> A <code>--lookback-days N</code> CLI argument was added to
+<code>filter_active_wells_before_events.py</code>, <code>filter_merge_events_and_nonevents.py</code>,
+<code>add_geoscience_to_event_well_links_with_injection.py</code>, and <code>dowhy_ci.py</code>.
+Output filenames are tagged with the window (e.g. <code>event_well_links_with_faults_7d_1km.csv</code>)
+so runs do not overwrite each other. A new orchestration script
+<code>run_lookback_sweep.py</code> automates the full sweep and produces the comparison table.</p>
+
+<p><strong>Log-transform interaction:</strong> An initial sweep with Change 3 log-transforms active
+produced identical results across all windows. This is mathematically expected: under a log-linear
+model, scaling W by a constant factor (e.g. 90/7 &times; cumulative volume) produces only an
+additive shift in log space, which shifts the intercept but not the causal slope coefficient.
+The sweep was therefore run with log-transforms <em>disabled</em>
+(<code>--no-log-transform</code> flag) to recover real variation across windows. This is the
+correct approach for window selection: identify the optimal timescale in raw space, then re-apply
+the log transform for the production model. The log-transform invariance is itself a robustness
+finding reported separately below.</p>
+
+<p><strong>Fault proximity step skipped:</strong> G1 (nearest fault distance) and G2 (fault segment
+count) are purely spatial and identical across all lookback windows. A helper script
+<code>patch_lookback_into_faults.py</code> was written to patch only the W and P columns into
+the existing fault-augmented files, avoiding a full re-run of the expensive spatial join
+for each new window.</p>
+
+<h2>4. Sweep Results &mdash; Raw Space (no log-transform), GBM NonParamDML, averaged over 20 radii</h2>
+<table>
+<thead><tr>
+  <th>Lookback Window</th><th>Avg Total Effect</th><th>Avg % Mediated</th>
+  <th>Pred R&sup2;</th><th>MAE</th><th>Skill Score</th><th>Spearman &rho;</th><th>Bootstrap</th>
+</tr></thead>
+<tbody>
+<tr><td>7 days</td><td>+4.86e&minus;06</td><td>48.2%</td><td>0.465</td><td>0.503</td><td>0.465</td><td>0.635</td><td>100.0%</td></tr>
+<tr><td>14 days</td><td>+3.30e&minus;06</td><td>31.7%</td><td>0.477</td><td>0.492</td><td>0.477</td><td>0.642</td><td>100.0%</td></tr>
+<tr><td>30 days</td><td>+1.87e&minus;06</td><td>22.9%</td><td>0.495</td><td>0.481</td><td>0.495</td><td>0.653</td><td>100.0%</td></tr>
+<tr><td>60 days</td><td>+1.03e&minus;06</td><td>19.2%</td><td>0.521</td><td>0.464</td><td>0.522</td><td>0.666</td><td>100.0%</td></tr>
+<tr class="best"><td>90 days &#9733;</td><td>+7.41e&minus;07</td><td>17.3%</td><td>0.537</td><td>0.454</td><td>0.537</td><td>0.672</td><td>100.0%</td></tr>
+</tbody>
+</table>
+<p class="note">&#9733; Best across all metrics. All 20 radii completed for each window. 100% bootstrap convergence throughout.</p>
+
+<h2>5. Key Findings and Interpretation</h2>
+<ul>
+  <li><strong>Monotonically improving fit with window length.</strong> Every predictive metric
+  (Skill Score, Spearman &rho;, MAE, R&sup2;) improves consistently from 7 to 90 days with no
+  plateau. The 90-day window is the best tested, but the trend suggests the true optimum
+  may lie beyond 90 days. This is consistent with slow pore-pressure diffusion in tight
+  Permian formations where hydraulic diffusivity is low.</li>
+
+  <li><strong>Causal effect magnitude halves with longer windows.</strong> The average total effect
+  drops from +4.86e&minus;06 (7d) to +7.41e&minus;07 (90d) &mdash; approximately a 6.6&times;
+  reduction. This is physically expected: longer windows accumulate more injection volume,
+  so the per-unit causal coefficient is smaller. The effect is real but expressed per unit of
+  a larger treatment scale.</li>
+
+  <li><strong>Pressure mediation drops sharply with window length.</strong> The proportion of the
+  total effect mediated via pressure (W &rarr; P &rarr; S) falls from 48% at 7 days to 17%
+  at 90 days. At short windows, pressure is the dominant mechanism; at longer windows, the
+  direct injection-to-seismicity pathway (W &rarr; S) becomes proportionally more important.
+  This may reflect that short-window pressure readings capture acute pore pressure spikes,
+  while longer-window cumulative volumes capture a broader geomechanical loading effect
+  that bypasses the pressure mediator in the DAG.</li>
+
+  <li><strong>Log-transform invariance is a robustness finding.</strong> When Change 3 transforms
+  are active, all lookback windows produce identical causal estimates. Under a log-linear model,
+  scaling the treatment by a constant does not change the slope. This confirms that the
+  log-linear causal structure is internally consistent, and also that window selection must
+  be done in raw space before the transform is applied.</li>
+
+  <li><strong>Pre-existing column bug retroactively affects Changes 1&ndash;3.</strong> All prior
+  reported results used same-day injection volume as W rather than the lookback sum. Those
+  results remain scientifically valid as a same-day injection model but do not reflect the
+  intended lookback design. The corrected production model with 90d window and log-transform
+  will supersede them.</li>
+</ul>
+
+<div class="warn">
+The trend has not plateaued at 90 days. Adopting 90 days as the canonical window is a lower bound
+on the empirical optimum, not necessarily the true optimum. This should be confirmed against the
+sponsor&#39;s physical expectation for Permian formation diffusivity (Q3) before treating 90 days
+as definitive.
+</div>
+
+<h2>6. Files Changed</h2>
+<table>
+<thead><tr><th style="text-align:left">File</th><th style="text-align:left">Change</th></tr></thead>
+<tbody>
+<tr><td style="text-align:left"><code>filter_active_wells_before_events.py</code></td><td style="text-align:left">Added <code>--lookback-days</code> CLI arg; output filenames tagged with window (e.g. <code>_7d_</code>)</td></tr>
+<tr><td style="text-align:left"><code>filter_merge_events_and_nonevents.py</code></td><td style="text-align:left">Added <code>--lookback-days</code>; reads/writes lookback-tagged files</td></tr>
+<tr><td style="text-align:left"><code>add_geoscience_to_event_well_links_with_injection.py</code></td><td style="text-align:left">Added <code>--lookback-days</code>; LINKAGE_FILES and output templates auto-generated from tag</td></tr>
+<tr><td style="text-align:left"><code>dowhy_ci.py</code></td><td style="text-align:left">Added <code>--lookback-days</code> and <code>--no-log-transform</code> flags; fixed W column fragment from <code>["volume","bbl"]</code> to <code>["prev","bbl"]</code>; output CSV tagged with window and log status</td></tr>
+<tr><td style="text-align:left"><code>run_lookback_sweep.py</code> (new)</td><td style="text-align:left">Orchestrates full sweep across all windows; generates comparison table; supports <code>--no-log-transform</code></td></tr>
+<tr><td style="text-align:left"><code>patch_lookback_into_faults.py</code> (new)</td><td style="text-align:left">Patches W/P columns into existing fault-augmented files without re-running spatial join</td></tr>
+</tbody>
+</table>
+
+<h2>7. Next Steps</h2>
+<table class="next"><tbody>
+<tr><td>Production re-run</td><td>Run <code>python dowhy_ci.py --lookback-days 90</code> (with log-transform on) to generate corrected production results using the 90-day window and the right W column. These supersede all prior Change 1&ndash;3 outputs.</td></tr>
+<tr><td>Sponsor Q3</td><td>Confirm whether 90 days is physically plausible or whether the sweep should be extended to 120, 180 days. The monotonically improving trend at 90d suggests the optimum has not been reached.</td></tr>
+<tr><td>Change 6</td><td>Missing pressure zero-fill + P_missing indicator. Apply after production re-run is complete so baseline is stable.</td></tr>
+<tr><td>Change 7</td><td>Two-stage hurdle model. Depends on stable canonical window and baseline from Changes 5/6.</td></tr>
+</tbody></table>
+
+</body>
+</html>

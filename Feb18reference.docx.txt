@@ -1,0 +1,56 @@
+﻿Project Geminae: Changes and Questions
+Reference document for sponsor meeting
+Proposed Changes
+Change 1: Replace the regression model
+Every causal relationship in the pipeline is estimated using OLS (Ordinary Least Squares), which is a basic linear model. It assumes a straight-line relationship between injection and seismicity, which is not physically realistic. The result is a causal R-squared of 0.04 at the well level, meaning the model explains almost none of the variance.
+The fix is to swap OLS for a Gradient Boosted Machine via EconML's NonParamDML. The causal structure (the DAG) stays the same, only the estimator changes. OLS stays in as a baseline for comparison with the paper.
+In the code: dowhy_ci.py lines 106-157. Three separate estimate_effect() calls each with method_name="backdoor.linear_regression". Also lines 115, 138, 162 where sm.OLS() is called directly for p-values and R-squared.
+Change 2: Replace R-squared as the main fit metric
+R-squared is currently the headline metric for both the causal model and the predictive hold-out evaluation. It was designed for linear models on normally distributed data. Applied here it has two problems: it can go negative when using nonlinear models on held-out data (looks like the model broke, but it's a metric failure not a model failure), and it gives no sense of how wrong predictions are in actual magnitude units.
+Replacements: 
+* Skill Score (normalized against a simple baseline)
+* Mean Absolute Error (we can provideerror in magnitude units, directly interpretable by the stakeholders)
+* Spearman rank correlation (handles skewed distributions)
+* R-squared stays in the output for backward compatibility.
+In the code: dowhy_ci.py line 163 (causal R-squared pulled from OLS fit), lines 291-296 (calculate_predictive_r2() function using sklearn r2_score), lines 421-422 (both metrics surfaced as headline columns in output CSV). These are the locations to extend with the new metrics.
+Change 3: Apply log-transforms consistently
+Injection volume W is log-transformed in one part of the pipeline but used raw in the causal estimation. Pressure P is never transformed anywhere. This means the predictive model and the causal model are working in different units, so their outputs are not directly comparable.
+The fix is one line: apply np.log1p() to both W and P in the data preparation step before anything else runs. This is gated on Q1 below, which asks whether a log-linear relationship is physically appropriate for this basin.
+In the code: dowhy_ci.py line 282 is where the transform currently happens (inside calculate_predictive_r2() only). The fix moves it upstream to the data prep block around line 359 in process_file(), so it applies to all downstream analysis.
+
+
+Change 4: Model how the injection effect changes with distance continuously
+The pipeline runs 20 separate models, one per radius (1 to 20 km), and compares the results afterward. The "20x near-field amplification" finding is produced by dividing those separate averages post-hoc. It is not modeled directly.
+The fix is to use a CausalForestDML model that treats distance from fault as a continuous variable within a single model. The output is a smooth hazard-by-distance curve rather than 20 disconnected point estimates. This is more actionable for operators and more defensible scientifically.
+In the code: dowhy_ci_aggregated.py is where the 20 separate files are processed independently. This change would introduce a new modeling step that takes the combined dataset and fits one CausalForestDML model with G1 (fault distance) as the effect modifier.
+Change 5: Test different lookback windows
+The pipeline sums injection activity from the 30 days before each earthquake and uses that as the treatment variable. That 30-day number is hardcoded and has never been tested against other values or validated against physical timescales.
+The fix is to expose it as a config parameter and run the full pipeline across 7, 14, 30, 60, and 90-day windows. This is gated on Q3 below, which asks what timescale is physically realistic for these formations.
+In the code: filter_active_wells_before_events.py has LOOKBACK_DAYS = 30 as a hardcoded constant. This becomes a CLI argument or config.yaml entry. config.yaml already lists the 30-day window as a fixed constant and is the right place to expose it.
+Change 6: Fix how missing pressure values are handled
+When pressure data is missing for a well, the pipeline fills it with the column median, which is a large positive number from actively injecting wells. If a well was missing from the records because it was idle, the correct value is near zero, not the median. This inflates the estimated effect of pressure on earthquakes.
+The fix is to zero-fill pressure and add a binary indicator variable (P_missing) so the model can account for the fact the value was imputed. This is gated on Q2 below, which asks whether missing data typically means idle or just unreported.
+In the code: dowhy_ci.py lines 349-350: data[covariates].fillna(data[covariates].median()). This line is replaced with a zero-fill plus a P_missing indicator column added to the covariate set before model fitting.
+Change 7: Separate earthquake occurrence from magnitude modeling
+The current pipeline models earthquake magnitude directly as a continuous outcome using a single regression equation. This implicitly assumes that injection volume affects magnitude in one smooth linear relationship. However, earthquake generation is a two-stage physical process: first, injection may trigger an event at all, and second, conditional on triggering, it influences how large that event becomes. By collapsing these into one regression, the model blends triggering probability and magnitude scaling into the same parameter, which reduces interpretability and may bias the estimated injection effect.
+The fix is to implement a two-stage (hurdle-style) framework. Stage 1 models the probability of earthquake occurrence using a binary classifier (logistic regression or gradient boosting). Stage 2 models magnitude conditional on occurrence using a regression model (preferably log-transformed or nonlinear). The DAG structure remains the same; only the outcome specification and estimator structure change.
+In the code: dowhy_ci.py where treatment="W" and outcome="S" are defined inside the CausalModel() block. The magnitude variable S should be replaced with a binary occurrence indicator for Stage 1. A second modeling block should then estimate conditional magnitude for rows where S > 0. The PoE construction section will then combine occurrence probability with conditional magnitude distribution instead of relying on a single normal residual assumption.
+
+
+Questions for the Sponsor
+Q1: Does the volume-to-pressure relationship follow a log-linear pattern here?
+From the literature, Darcy's Law predicts a log-linear relationship between injection flow rate and reservoir pressure under steady-state conditions in a homogeneous formation. That's the standard justification for log-transforming both volume and pressure before fitting a causal model, and it's what we plan to do in Change 3.
+What we're less sure about is whether that holds in the Permian Basin specifically. The basin has multiple stacked disposal formations with different permeabilities, many wells targeting different intervals, and conditions that are far from steady-state in active injection areas. The log-linear assumption might be a reasonable first-order approximation, or the heterogeneity might be significant enough that a different functional form fits better.
+Does log-linear hold well enough at field scale here, or is this something we should test against other functional forms before committing?
+Q2: Is missing pressure data typically an idle well or a reporting gap?
+The RRC dataset has wells with missing pressure values for certain reporting periods. The standard approach to missing data is median imputation, which is what the pipeline currently does. The problem is that this only makes sense if the missing values are random. If wells are systematically missing pressure data because they were shut in or not operating, the correct fill is near zero, not the median of active wells.
+We have read that RRC reporting compliance varies and that some operators routinely miss submissions. We do not know whether that applies here or whether the missing records in this specific dataset follow a pattern tied to operational status.
+From your experience with this data: is missing pressure typically because the well was not operating, or is it more likely a reporting/submission issue?
+Q3: What is a realistic injection-to-seismicity lag time for Permian formations?
+The literature on pore pressure diffusion gives a wide range. Hydraulic diffusivity varies by orders of magnitude depending on formation permeability. Studies in tight carbonate systems like the Ellenberger suggest pressure fronts can travel several kilometers in weeks. Other work in lower-permeability clastic intervals suggests diffusion over months. The 30-day window in the pipeline sits somewhere in the middle of that range without being anchored to anything specific.
+We want to run a sensitivity sweep across 7 to 90 days (Change 5), but rather than just picking whichever window maximizes fit, we want to know what range is physically plausible for the primary disposal formations in this dataset. Picking based on fit alone risks finding a spurious optimum.
+What lag timescale would you expect to be most physically meaningful here? Is 30 days a reasonable estimate, or would you expect it to be shorter or longer for the formations involved?
+Q4: Are there any potentially important variables missing from the causal model?
+The current DAG has five variables: nearest fault distance (G1), fault segment count within the radius (G2), injection volume (W), injection pressure (P), and earthquake magnitude (S). G1 and G2 are the confounders. The concern is whether those two spatial variables are sufficient to account for everything that independently affects both injection decisions and seismic susceptibility.
+From the geomechanics literature, candidates for additional confounders include formation depth and the specific disposal interval targeted (affects both where operators choose to inject and the ambient stress environment), fault orientation relative to the regional stress field (faults optimally oriented for slip under the current stress regime are more susceptible regardless of injection volume), rate of volume change rather than cumulative volume (some studies suggest rate increases are more seismogenic than steady injection), and proximity to prior seismicity clusters (which may indicate pre-existing critically stressed faults).
+Are any of these, or anything else, variables you would expect to be materially important here that are not currently in the model?

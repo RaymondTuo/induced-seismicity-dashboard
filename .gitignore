@@ -1,0 +1,9 @@
+
+*.png
+*.shx
+*.csv
+*.mp4
+
+.idea
+.venv
+
