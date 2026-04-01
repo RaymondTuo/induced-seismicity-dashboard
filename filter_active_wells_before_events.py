@@ -32,8 +32,8 @@ if hasattr(sys.stdout, "reconfigure"):
 
 # ──────────────────── CLI argument ────────────────────────────────
 _parser = argparse.ArgumentParser()
-_parser.add_argument("--lookback-days", type=int, default=30,
-                     help="Days before event to aggregate injection over (default: 30)")
+_parser.add_argument("--lookback-days", type=int, default=90,
+                     help="Days before event to aggregate injection over (default: 90)")
 _args = _parser.parse_args()
 LOOKBACK_DAYS = _args.lookback_days
 LOOKBACK_TAG  = f"{LOOKBACK_DAYS}d"

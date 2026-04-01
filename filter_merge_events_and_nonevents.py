@@ -44,7 +44,7 @@ def concatenate(event_path: Path, fake_df: pd.DataFrame, out_path: Path) -> None
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--lookback-days", type=int, default=30,
+    parser.add_argument("--lookback-days", type=int, default=90,
                         help="Lookback window in days (must match filter_active_wells run)")
     args = parser.parse_args()
     tag = f"{args.lookback_days}d"

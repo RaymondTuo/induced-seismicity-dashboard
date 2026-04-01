@@ -42,7 +42,7 @@ except ImportError:
 
 # ─── CLI ───────────────────────────────────────────────────────
 _parser = argparse.ArgumentParser()
-_parser.add_argument("--lookback-days", type=int, default=30,
+_parser.add_argument("--lookback-days", type=int, default=90,
                      help="Lookback window in days (must match upstream scripts)")
 _args, _ = _parser.parse_known_args()
 _TAG = f"{_args.lookback_days}d"

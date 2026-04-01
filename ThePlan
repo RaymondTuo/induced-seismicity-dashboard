@@ -44,7 +44,7 @@ STEP 0 · ENVIRONMENT & CONSTANTS
 | Planar CRS for distances     | EPSG 3857  (Web Mercator)        |
 | Well–event link distance     | 1-20 km (varied)                 |
 | Fault-segment length         | ~1 km                            |
-| Injection look-back window   | 30 days                          |
+| Injection look-back window   | 90 days                          |
 | Random seed (DoWhy)          | 42                               |
 
 STEP 1 · IMPORT & FILTER RAW TABLES
@@ -97,9 +97,9 @@ New columns added
   • Volume Injected (BBLs) – same day
   • Injection Pressure Average PSIG – same day
   • Injection Pressure Max PSIG – same day
-  • Vol Prev N (BBLs)      – 30-day total before event
-  • Avg Press Prev N (PSIG) – 30-day mean before event
-  • Max Press Prev N (PSIG) – 30-day max before event
+  • Vol Prev N (BBLs)      – 90-day total before event
+  • Avg Press Prev N (PSIG) – 90-day mean before event
+  • Max Press Prev N (PSIG) – 90-day max before event
 
 "Innocent wells" are those linked to events but not actively injecting on the event day (magnitude set to 0).
 For these wells, the most recent injection date before the event is identified, with second script

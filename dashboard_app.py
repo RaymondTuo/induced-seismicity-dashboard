@@ -40,7 +40,7 @@ def build_fallback_data() -> pd.DataFrame:
                 "total_effect": (2.0e-5 * np.exp(-r / 5)) + (8.0e-6 * np.exp(-r / 8) + 1.8e-6),
                 "mediation_pct": 100 * (8.0e-6 * np.exp(-r / 8) + 1.8e-6)
                 / ((2.0e-5 * np.exp(-r / 5)) + (8.0e-6 * np.exp(-r / 8) + 1.8e-6)),
-                "lookback_days": 30,
+                "lookback_days": 90,
                 "pressure_missing_pct": 4 + 0.15 * r,
                 "log_transform_applied": True,
                 "hurdle_occurrence_prob": min(0.95, 0.12 + 0.03 * np.exp(-r / 6) + 0.004 * r),
@@ -60,7 +60,7 @@ def build_fallback_data() -> pd.DataFrame:
                 "total_effect": (2.3e-5 * np.exp(-r / 5.2)) + (9.5e-6 * np.exp(-r / 7.8) + 1.9e-6),
                 "mediation_pct": 100 * (9.5e-6 * np.exp(-r / 7.8) + 1.9e-6)
                 / ((2.3e-5 * np.exp(-r / 5.2)) + (9.5e-6 * np.exp(-r / 7.8) + 1.9e-6)),
-                "lookback_days": 30,
+                "lookback_days": 90,
                 "pressure_missing_pct": 4 + 0.15 * r,
                 "log_transform_applied": True,
                 "hurdle_occurrence_prob": min(0.96, 0.14 + 0.03 * np.exp(-r / 6) + 0.004 * r),
@@ -112,7 +112,7 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     elif "model_type" not in df.columns:
         df["model_type"] = "NonParamDML"
     if "lookback_days" not in df.columns:
-        df["lookback_days"] = 30
+        df["lookback_days"] = 90
     if "log_transform_applied" not in df.columns:
         df["log_transform_applied"] = True
     if "pressure_missing_pct" not in df.columns:

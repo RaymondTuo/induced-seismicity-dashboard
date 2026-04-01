@@ -124,7 +124,7 @@ STEP 0 · ENVIRONMENT & CONSTANTS
 | Planar CRS for distances     | EPSG 3857  (Web Mercator)        |
 | Well–event link distance     | 2, 5, 10, 15, 20 km (varied)     |
 | Fault-segment length         | ~1 km                            |
-| Injection look-back window   | 30 days                          |
+| Injection look-back window   | 90 days                          |
 | Random seed (DoWhy)          | 42                               |
     """)
 
