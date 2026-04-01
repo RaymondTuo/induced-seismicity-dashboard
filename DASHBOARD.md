@@ -1,18 +1,23 @@
 # Dashboard Quick Start
 
-## Run locally
+## Run locally (recommended)
 
-1. Install dependencies:
+1. Create the Python 3.12 environment once:
 
 ```bash
-pip install -r requirements.txt
+py -3.12 -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
 2. Start the app:
 
 ```bash
-streamlit run dashboard_app.py
+run_dashboard.bat
 ```
+
+3. Open:
+
+`http://localhost:8502`
 
 ## Dashboard sections
 
