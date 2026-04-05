@@ -7,7 +7,7 @@ from sklearn.utils import resample
 from sklearn.model_selection import train_test_split
 from sklearn.base import clone
 from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, roc_auc_score
 from scipy.stats import spearmanr, t as student_t
 import statsmodels.api as sm
 from statsmodels.stats.outliers_influence import variance_inflation_factor
@@ -30,9 +30,9 @@ from datetime import datetime
 
 # --- CHANGE 5: CLI arguments for lookback window and log-transform control ---
 _parser = argparse.ArgumentParser()
-_parser.add_argument("--lookback-days", type=int, default=None,
-                     help="Lookback window in days. If set, only reads files tagged with "
-                          "that window (e.g. 7d). Omit to read untagged (legacy) files.")
+_parser.add_argument("--lookback-days", type=int, default=90,
+                     help="Lookback window in days (default: 90, selected as optimal in Change 5). "
+                          "Reads files tagged with that window (e.g. 90d).")
 _parser.add_argument("--no-log-transform", action="store_true",
                      help="Disable Change 3 log-transforms on W and P. Use for lookback "
                           "sweep to identify optimal window in raw space before re-applying "
@@ -43,12 +43,15 @@ LOOKBACK_TAG = f"{LOOKBACK_DAYS_ARG}d" if LOOKBACK_DAYS_ARG is not None else Non
 APPLY_LOG_TRANSFORM = not _args.no_log_transform
 # --- END CHANGE 5 ---
 
+# Change 6: zero-fill pressure; binary P_missing as covariate (not median P).
+P_MISSING_COL = "P_missing"
+
 # --- CHANGE 1: New imports for nonlinear causal estimators ---
 # GradientBoostingRegressor and RandomForestRegressor are used as the model_y,
 # model_t, and model_final components inside EconML's NonParamDML estimator,
 # which DoWhy invokes via the string "backdoor.econml.dml.NonParamDML".
 # Lasso is included as a regularised-linear midpoint between OLS and fully nonlinear.
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor, RandomForestRegressor
 from sklearn.linear_model import Lasso
 
 # econml.dml is loaded dynamically by DoWhy from the method_name string.
@@ -361,13 +364,13 @@ def calculate_mediation_effects_dowhy(data, model_config=None):
 
     data = data.copy().reset_index(drop=True)
 
-    # Build the causal DAG (unchanged)
+    pm = P_MISSING_COL
     G = nx.DiGraph([
-        ('G1', 'W'), ('G1', 'P'), ('G1', 'S'),  # Confounder paths from G1
-        ('G2', 'W'), ('G2', 'P'), ('G2', 'S'),  # Confounder paths from G2
-        ('W', 'P'),  # Treatment → Mediator
-        ('P', 'S'),  # Mediator  → Outcome
-        ('W', 'S'),  # Direct Treatment → Outcome
+        ('G1', 'W'), ('G1', 'P'), ('G1', 'S'), ('G1', pm),
+        ('G2', 'W'), ('G2', 'P'), ('G2', 'S'), ('G2', pm),
+        ('W', 'P'), ('W', 'S'), ('W', pm),
+        ('P', 'S'),
+        (pm, 'S'),
     ])
 
     # CHANGE 1: pull estimator settings out of the config dict.
@@ -405,13 +408,13 @@ def calculate_mediation_effects_dowhy(data, model_config=None):
         # For nonlinear models, a_pval is set to np.nan here and later derived
         # from the bootstrap distribution in process_file().
         if uses_ols_pvalues:
-            X_a = sm.add_constant(data[['W', 'G1', 'G2']])
+            X_a = sm.add_constant(data[['W', 'G1', 'G2', P_MISSING_COL]])
             model_a_sm = fit_ols_stable(data['P'], X_a)
             a_pval = model_a_sm.pvalues['W']
         else:
             # --- CHANGE 1: replaced sm.OLS p-value with np.nan for nonlinear models ---
             # Original lines were:
-            #   X_a = sm.add_constant(data[['W', 'G1', 'G2']])
+            #   X_a = sm.add_constant(data[['W', 'G1', 'G2', P_MISSING_COL]])
             #   model_a_sm = sm.OLS(data['P'], X_a).fit()
             #   a_pval = model_a_sm.pvalues['W']
             a_pval = np.nan  # bootstrap p-value computed in process_file()
@@ -420,7 +423,7 @@ def calculate_mediation_effects_dowhy(data, model_config=None):
     except Exception as e:
         print(f"Warning: DoWhy path a estimation failed: {e}")
         # Fallback to statsmodels OLS regardless of model_config
-        model_a_sm = fit_ols_stable(data['P'], sm.add_constant(data[['W', 'G1', 'G2']]))
+        model_a_sm = fit_ols_stable(data['P'], sm.add_constant(data[['W', 'G1', 'G2', P_MISSING_COL]]))
         a_coef_dowhy = model_a_sm.params['W']
         a_pval = model_a_sm.pvalues['W']
 
@@ -450,13 +453,13 @@ def calculate_mediation_effects_dowhy(data, model_config=None):
 
         # CHANGE 1: same p-value logic as path a
         if uses_ols_pvalues:
-            X_b = sm.add_constant(data[['P', 'W', 'G1', 'G2']])
+            X_b = sm.add_constant(data[['P', 'W', 'G1', 'G2', P_MISSING_COL]])
             model_b_sm = fit_ols_stable(data['S'], X_b)
             b_pval = model_b_sm.pvalues['P']
         else:
             # --- CHANGE 1: replaced sm.OLS p-value with np.nan for nonlinear models ---
             # Original lines were:
-            #   X_b = sm.add_constant(data[['P', 'W', 'G1', 'G2']])
+            #   X_b = sm.add_constant(data[['P', 'W', 'G1', 'G2', P_MISSING_COL]])
             #   model_b_sm = sm.OLS(data['S'], X_b).fit()
             #   b_pval = model_b_sm.pvalues['P']
             b_pval = np.nan  # bootstrap p-value computed in process_file()
@@ -465,7 +468,7 @@ def calculate_mediation_effects_dowhy(data, model_config=None):
     except Exception as e:
         print(f"Warning: DoWhy path b estimation failed: {e}")
         # Fallback to statsmodels OLS regardless of model_config
-        model_b_sm = fit_ols_stable(data['S'], sm.add_constant(data[['P', 'W', 'G1', 'G2']]))
+        model_b_sm = fit_ols_stable(data['S'], sm.add_constant(data[['P', 'W', 'G1', 'G2', P_MISSING_COL]]))
         b_coef_dowhy = model_b_sm.params['P']
         b_pval = model_b_sm.pvalues['P']
 
@@ -497,14 +500,14 @@ def calculate_mediation_effects_dowhy(data, model_config=None):
         # For nonlinear models, model_c_r2 is set to np.nan. Change 2 will
         # replace R² with proper nonlinear metrics (MAE, Skill Score, Spearman).
         if uses_ols_pvalues:
-            X_c = sm.add_constant(data[['W', 'G1', 'G2']])
+            X_c = sm.add_constant(data[['W', 'G1', 'G2', P_MISSING_COL]])
             model_c_sm = fit_ols_stable(data['S'], X_c)
             c_pval = model_c_sm.pvalues['W']
             model_c_r2 = model_c_sm.rsquared
         else:
             # --- CHANGE 1: replaced sm.OLS p-value and R² for nonlinear models ---
             # Original lines were:
-            #   X_c = sm.add_constant(data[['W', 'G1', 'G2']])
+            #   X_c = sm.add_constant(data[['W', 'G1', 'G2', P_MISSING_COL]])
             #   model_c_sm = sm.OLS(data['S'], X_c).fit()
             #   c_pval = model_c_sm.pvalues['W']
             #   model_c_r2 = model_c_sm.rsquared
@@ -515,7 +518,7 @@ def calculate_mediation_effects_dowhy(data, model_config=None):
     except Exception as e:
         print(f"Warning: DoWhy total effect estimation failed: {e}")
         # Fallback to statsmodels OLS regardless of model_config
-        model_c_sm = fit_ols_stable(data['S'], sm.add_constant(data[['W', 'G1', 'G2']]))
+        model_c_sm = fit_ols_stable(data['S'], sm.add_constant(data[['W', 'G1', 'G2', P_MISSING_COL]]))
         c_coef_dowhy = model_c_sm.params['W']
         c_pval = model_c_sm.pvalues['W']
         model_c_r2 = model_c_sm.rsquared
@@ -530,7 +533,7 @@ def calculate_mediation_effects_dowhy(data, model_config=None):
     # mediation framework (Imai et al. 2010) which is out of scope for Change 1.
     # OLS here gives a conservative, cross-model-comparable c' estimate.
     # -------------------------------------------------------------------------
-    model_direct = fit_ols_stable(data['S'], sm.add_constant(data[['P', 'W', 'G1', 'G2']]))
+    model_direct = fit_ols_stable(data['S'], sm.add_constant(data[['P', 'W', 'G1', 'G2', P_MISSING_COL]]))
     c_prime_coef = model_direct.params['W']
     c_prime_pval = model_direct.pvalues['W']
 
@@ -624,11 +627,12 @@ def run_dowhy_refutations(data, model_config=None):
         model_config = MODEL_CONFIGS["ols_baseline"]
 
     try:
-        # Build the causal DAG (unchanged)
+        pm = P_MISSING_COL
         G = nx.DiGraph([
-            ('G1', 'W'), ('G1', 'P'), ('G1', 'S'),
-            ('G2', 'W'), ('G2', 'P'), ('G2', 'S'),
-            ('W', 'P'), ('P', 'S'), ('W', 'S'),
+            ('G1', 'W'), ('G1', 'P'), ('G1', 'S'), ('G1', pm),
+            ('G2', 'W'), ('G2', 'P'), ('G2', 'S'), ('G2', pm),
+            ('W', 'P'), ('P', 'S'), ('W', 'S'), ('W', pm),
+            (pm, 'S'),
         ])
 
         dag_dot = nx.nx_pydot.to_pydot(G).to_string()
@@ -693,7 +697,7 @@ def calculate_predictive_metrics(data, model_config=None):
         model_config = MODEL_CONFIGS["ols_baseline"]
 
     try:
-        X = data[['W', 'P', 'G1', 'G2']].copy()
+        X = data[['W', 'P', 'G1', 'G2', P_MISSING_COL]].copy()
         # --- CHANGE 3: removed local W-only transform that was here ---
         # Original line was:
         #   X['W'] = np.log1p(X['W'])  # keep existing behavior for now
@@ -756,6 +760,106 @@ def calculate_predictive_metrics(data, model_config=None):
         }
 
 
+# =============================================================================
+# CHANGE 7: Hurdle model — two-stage framework separating occurrence from magnitude
+# =============================================================================
+
+def fit_hurdle_model(data):
+    """CHANGE 7: Two-stage hurdle model separating earthquake occurrence from magnitude.
+
+    Physical motivation: injection triggering is a two-stage process.
+      Stage 1 — does injection trigger an event at all? (binary)
+      Stage 2 — conditional on triggering, how large is the event? (continuous)
+    Collapsing these into one regression blends triggering probability and magnitude
+    scaling into the same parameter, reducing interpretability.
+
+    Per Chris Reudelhueber's feedback, formation depth (shallow vs. Ellenburger-and-
+    below) is a known missing confounder for Stage 1: shallow-zone wells are
+    physically disconnected from seismogenic faults. Stage 1 partially captures
+    this through correlation with G1/G2 but cannot separate it cleanly without
+    disposal-interval data.
+
+    Stage 1: GBM binary classifier predicts P(S > 0) using W, P, G1, G2, P_missing.
+    Stage 2: GBM regressor predicts magnitude conditional on S > 0 (event rows only).
+
+    Returns per-radius summary scalars for dashboard output:
+      hurdle_occurrence_prob       mean P(occurrence) on the held-out test set
+      hurdle_conditional_magnitude mean predicted magnitude on event test rows
+      hurdle_stage1_auc            ROC-AUC for the Stage 1 classifier
+      hurdle_stage2_mae            MAE in magnitude units for Stage 2
+    """
+    _nan_result = {
+        'hurdle_occurrence_prob': np.nan,
+        'hurdle_conditional_magnitude': np.nan,
+        'hurdle_stage1_auc': np.nan,
+        'hurdle_stage2_mae': np.nan,
+    }
+
+    try:
+        features = ['W', 'P', 'G1', 'G2', P_MISSING_COL]
+        X = data[features].copy()
+        S_binary = (data['S'] > 0).astype(int)
+        S_magnitude = data['S'].copy()
+
+        if S_binary.nunique() < 2:
+            print("  ⚠️  Hurdle Stage 1: only one class in S_binary — skipping.")
+            return _nan_result
+
+        x_tr, x_te, yb_tr, yb_te, ym_tr, ym_te = train_test_split(
+            X, S_binary, S_magnitude, test_size=0.20, random_state=42, shuffle=True
+        )
+
+        # --- Stage 1: binary occurrence classifier ---
+        clf = GradientBoostingClassifier(n_estimators=100, random_state=42)
+        clf.fit(x_tr, yb_tr)
+        occ_prob = clf.predict_proba(x_te)[:, 1]
+        stage1_auc = float(roc_auc_score(yb_te, occ_prob)) if yb_te.nunique() > 1 else np.nan
+
+        # --- Stage 2: conditional magnitude regression (events only) ---
+        event_idx_tr = yb_tr[yb_tr == 1].index
+        event_idx_te = yb_te[yb_te == 1].index
+
+        if len(event_idx_tr) < 10:
+            print(f"  ⚠️  Hurdle Stage 2: only {len(event_idx_tr)} event rows in train — skipping Stage 2.")
+            return {
+                'hurdle_occurrence_prob': float(occ_prob.mean()),
+                'hurdle_conditional_magnitude': np.nan,
+                'hurdle_stage1_auc': stage1_auc,
+                'hurdle_stage2_mae': np.nan,
+            }
+
+        reg = GradientBoostingRegressor(n_estimators=100, random_state=42)
+        reg.fit(x_tr.loc[event_idx_tr], ym_tr.loc[event_idx_tr])
+
+        if len(event_idx_te) > 0:
+            mag_pred = reg.predict(x_te.loc[event_idx_te])
+            stage2_mae = float(mean_absolute_error(ym_te.loc[event_idx_te], mag_pred))
+            cond_mag = float(mag_pred.mean())
+        else:
+            stage2_mae = np.nan
+            cond_mag = np.nan
+
+        cond_str = f"{cond_mag:.3f}" if cond_mag is not None and not np.isnan(cond_mag) else "n/a"
+        mae_str = f"{stage2_mae:.3f}" if stage2_mae is not None and not np.isnan(stage2_mae) else "n/a"
+        print(f"  ✅ Hurdle model: P(occur)={float(occ_prob.mean()):.3f}, "
+              f"AUC={stage1_auc:.3f}, E[mag|occur]={cond_str}, Stage2 MAE={mae_str}")
+
+        return {
+            'hurdle_occurrence_prob': float(occ_prob.mean()),
+            'hurdle_conditional_magnitude': cond_mag,
+            'hurdle_stage1_auc': stage1_auc,
+            'hurdle_stage2_mae': stage2_mae,
+        }
+
+    except Exception as e:
+        print(f"  Warning: Hurdle model failed: {e}")
+        return _nan_result
+
+# =============================================================================
+# END CHANGE 7
+# =============================================================================
+
+
 def process_file(csv_file):
     """Process a single radius file across all model configs.
 
@@ -800,13 +904,18 @@ def process_file(csv_file):
         rename_map = {found[k]: safe(k) for k in found}
         data = df_raw[list(found.values())].rename(columns=rename_map)
 
+        p_col = safe("P")
+        data[P_MISSING_COL] = data[p_col].isna().astype(np.float64)
+        data[p_col] = data[p_col].fillna(0.0)
+
         essential = [safe("W"), safe("S")]
         rows_before = len(data)
         data = data.dropna(subset=essential)
         rows_after = len(data)
 
-        covariates = [safe(c) for c in ["P", "G1", "G2"] if safe(c) in data.columns]
-        data[covariates] = data[covariates].fillna(data[covariates].median(numeric_only=True))
+        geo_cov = [safe(c) for c in ["G1", "G2"] if safe(c) in data.columns]
+        if geo_cov:
+            data[geo_cov] = data[geo_cov].fillna(data[geo_cov].median(numeric_only=True))
 
         data = data.rename(columns={
             safe("W"): "W",
@@ -832,21 +941,27 @@ def process_file(csv_file):
             data['P'] = np.log1p(data['P'].clip(lower=0))
         # --- END CHANGE 3 ---
 
-        finite_cov = [c for c in ("W", "P", "S", "G1", "G2") if c in data.columns]
+        finite_cov = [c for c in ("W", "P", "S", "G1", "G2", P_MISSING_COL) if c in data.columns]
         _ok = np.isfinite(data[finite_cov].to_numpy(dtype=float)).all(axis=1)
         if not _ok.all():
             n_bad = int((~_ok).sum())
-            print(f"Warning: dropping {n_bad:,} rows with non-finite W/P/S/G1/G2 after transforms")
+            print(f"Warning: dropping {n_bad:,} rows with non-finite W/P/S/G1/G2/P_missing after transforms")
             data = data.loc[_ok]
 
         print(f"✅ Clean data: {len(data):,} rows (dropped {rows_before - rows_after:,})")
+        print(f"   Rows with missing pressure (pre-zero-fill): {100.0 * data[P_MISSING_COL].mean():.2f}%")
 
         # VIF calculation depends only on data, not on the estimator — compute once
-        X_a = sm.add_constant(data[['W', 'G1', 'G2']])
+        X_a = sm.add_constant(data[['W', 'G1', 'G2', P_MISSING_COL]])
         vif_a_avg = calculate_vif(X_a)['VIF'].mean()
 
-        X_b = sm.add_constant(data[['W', 'P', 'G1', 'G2']])
+        X_b = sm.add_constant(data[['W', 'P', 'G1', 'G2', P_MISSING_COL]])
         vif_b_avg = calculate_vif(X_b)['VIF'].mean()
+
+        # --- CHANGE 7: Fit hurdle model once per file (not per estimator) ---
+        print(f"\n  🔄 Hurdle model (Change 7)...")
+        hurdle = fit_hurdle_model(data)
+        # --- END CHANGE 7 ---
 
         # =====================================================================
         # CHANGE 1: Loop over all model configs.
@@ -950,6 +1065,12 @@ def process_file(csv_file):
                     'placebo_effect': refutations['placebo_effect'],
                     'subset_effect': refutations['subset_effect'],
                     'dowhy_original_effect': refutations['original_effect'],
+                    'pressure_missing_pct': 100.0 * float(data[P_MISSING_COL].mean()),
+                    # CHANGE 7: hurdle model outputs (same for all models at this radius)
+                    'hurdle_occurrence_prob': hurdle['hurdle_occurrence_prob'],
+                    'hurdle_conditional_magnitude': hurdle['hurdle_conditional_magnitude'],
+                    'hurdle_stage1_auc': hurdle['hurdle_stage1_auc'],
+                    'hurdle_stage2_mae': hurdle['hurdle_stage2_mae'],
                 })
 
             except Exception as e:

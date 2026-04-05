@@ -121,6 +121,10 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         df["hurdle_occurrence_prob"] = np.nan
     if "hurdle_conditional_magnitude" not in df.columns:
         df["hurdle_conditional_magnitude"] = np.nan
+    if "hurdle_stage1_auc" not in df.columns:
+        df["hurdle_stage1_auc"] = np.nan
+    if "hurdle_stage2_mae" not in df.columns:
+        df["hurdle_stage2_mae"] = np.nan
     return df
 
 
@@ -250,17 +254,34 @@ def main() -> None:
 
     with tabs[5]:
         st.subheader("Occurrence vs Magnitude Modeling (Hurdle Model)")
+        st.caption(
+            "Stage 1 predicts P(earthquake occurs) via GBM binary classifier. "
+            "Stage 2 predicts magnitude conditional on occurrence (event rows only). "
+            "Note: formation depth (shallow vs. Ellenburger) is a known missing confounder "
+            "for Stage 1 — unavailable without external well-completion records."
+        )
         c1, c2 = st.columns(2)
         with c1:
             if view_df["hurdle_occurrence_prob"].notna().any():
+                st.markdown("**Stage 1 — P(occurrence)**")
                 st.plotly_chart(px.line(view_df, x="radius_km", y="hurdle_occurrence_prob", color="model_type", markers=True), use_container_width=True)
             else:
                 st.info("`hurdle_occurrence_prob` not present in source file.")
         with c2:
             if view_df["hurdle_conditional_magnitude"].notna().any():
+                st.markdown("**Stage 2 — E[magnitude | occurrence]**")
                 st.plotly_chart(px.line(view_df, x="radius_km", y="hurdle_conditional_magnitude", color="model_type", markers=True), use_container_width=True)
             else:
                 st.info("`hurdle_conditional_magnitude` not present in source file.")
+        c3, c4 = st.columns(2)
+        with c3:
+            if view_df["hurdle_stage1_auc"].notna().any():
+                st.markdown("**Stage 1 — ROC-AUC**")
+                st.plotly_chart(px.line(view_df, x="radius_km", y="hurdle_stage1_auc", color="model_type", markers=True), use_container_width=True)
+        with c4:
+            if view_df["hurdle_stage2_mae"].notna().any():
+                st.markdown("**Stage 2 — MAE (magnitude units)**")
+                st.plotly_chart(px.line(view_df, x="radius_km", y="hurdle_stage2_mae", color="model_type", markers=True), use_container_width=True)
 
     with tabs[6]:
         st.subheader("Interactive Data Table")

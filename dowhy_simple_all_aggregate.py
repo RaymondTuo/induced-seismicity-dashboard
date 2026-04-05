@@ -76,6 +76,9 @@ CSV_FILES = [
 # Output summary file
 RESULTS_CSV = "event_level_causal_analysis_by_radius.csv"
 
+# Change 6: well-level P_missing → aggregate as fraction; zero-fill P before agg
+P_MISSING_COL = "P_missing"
+
 # ─── 1 ▸ COLUMN-NAME FRAGMENTS  (tweak as needed) ──────────────
 COL_FRAGS = {
     "E": ["event", "id"],  # EventID
@@ -151,6 +154,11 @@ def process_file(csv_file: str) -> dict:
     rename_map = {found[k]: safe(k) for k in found}
     df = df_raw[list(found.values())].rename(columns=rename_map)
 
+    # Change 6: indicator then zero-fill P at well level before aggregating
+    p_col = safe("P")
+    df[P_MISSING_COL] = df[p_col].isna().astype(np.float64)
+    df[p_col] = df[p_col].fillna(0.0)
+
     # b) aggregate to one row per EventID
     aggregated = (
         df
@@ -158,6 +166,7 @@ def process_file(csv_file: str) -> dict:
         .agg({
             safe("W"): "sum",
             safe("P"): "median",
+            P_MISSING_COL: "mean",  # fraction of wells in radius with missing P (pre-fill)
             safe("G1"): "min",
             safe("G2"): "sum",
             safe("S"): "first",  # magnitude identical within group
@@ -175,25 +184,30 @@ def process_file(csv_file: str) -> dict:
     rows_dropped = rows_before - rows_after
     print(f"Dropped {rows_dropped:,} events missing treatment or outcome ({rows_dropped / rows_before:.1%} if any)")
 
-    covariates = [c for c in [safe("P"), safe("G1"), safe("G2"), "well_count"]
+    covariates = [c for c in [safe("P"), P_MISSING_COL, safe("G1"), safe("G2"), "well_count"]
                   if c in aggregated.columns]
-    aggregated[covariates] = aggregated[covariates].fillna(
-        aggregated[covariates].median(numeric_only=True)
-    )
+    covariates_median = [c for c in covariates if c not in (safe("P"), P_MISSING_COL)]
+    if covariates_median:
+        aggregated[covariates_median] = aggregated[covariates_median].fillna(
+            aggregated[covariates_median].median(numeric_only=True)
+        )
 
     if aggregated.empty:
         print("\n❌  No events retain both treatment and outcome — skipping file.")
         return None
 
     W, P, S, G1, G2 = map(safe, ["W", "P", "S", "G1", "G2"])
+    PM = P_MISSING_COL
     print("✅  Events after aggregation & cleaning:", len(aggregated))
+    print(f"   Mean fraction wells with missing pressure (within radius): {aggregated[PM].mean():.1%}")
 
     # ─── 4 ▸ DAG (networkx) ────────────────────────────────────────
     G = nx.DiGraph([
-        (G1, W), (G1, P), (G1, S),
-        (G2, W), (G2, P), (G2, S),
-        ("well_count", W),  # density may affect total volume
-        (W, P), (P, S), (W, S),
+        (G1, W), (G1, P), (G1, S), (G1, PM),
+        (G2, W), (G2, P), (G2, S), (G2, PM),
+        ("well_count", W), ("well_count", PM),
+        (W, P), (W, S), (W, PM),
+        (P, S), (PM, S),
     ])
 
     # ─── 5 ▸ DoWhy causal estimate ─────────────────────────────────
@@ -269,7 +283,7 @@ def process_file(csv_file: str) -> dict:
 
     # ─── 7 ▸ Predictive sanity-check ───────────────────────────────
     with step("Training predictive sanity-check model"):
-        X = aggregated[[W, P, G1, G2, "well_count"]].copy()
+        X = aggregated[[W, P, G1, G2, "well_count", PM]].copy()
         X[W] = np.log1p(X[W])
         y = aggregated[S]
         x_tr, x_te, y_tr, y_te = train_test_split(

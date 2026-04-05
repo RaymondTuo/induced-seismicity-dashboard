@@ -4,7 +4,8 @@ import warnings
 from sklearn.utils import resample
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, roc_auc_score
+from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor
 import statsmodels.api as sm
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from dowhy import CausalModel
@@ -44,6 +45,9 @@ if not any(f.endswith('.csv') for f in os.listdir('.') if os.path.isfile(f)):
         print(f"Changed to: {os.getcwd()}")
 
 print("\nLooking for data files...")
+
+# Change 6: zero-fill P at well level; aggregate P_missing as fraction per event
+P_MISSING_COL = "P_missing"
 
 
 def find_csv_files():
@@ -105,14 +109,14 @@ def calculate_mediation_effects_dowhy(data):
 
     data = data.copy().reset_index(drop=True)
 
-    # Build the causal DAG including well_count as an additional confounder
+    pm = P_MISSING_COL
     G = nx.DiGraph([
-        ('G1', 'W'), ('G1', 'P'), ('G1', 'S'),  # Confounder paths from G1
-        ('G2', 'W'), ('G2', 'P'), ('G2', 'S'),  # Confounder paths from G2
-        ('well_count', 'W'), ('well_count', 'P'), ('well_count', 'S'),  # Well count confounding
-        ('W', 'P'),  # Treatment → Mediator
-        ('P', 'S'),  # Mediator  → Outcome
-        ('W', 'S'),  # Direct Treatment → Outcome
+        ('G1', 'W'), ('G1', 'P'), ('G1', 'S'), ('G1', pm),
+        ('G2', 'W'), ('G2', 'P'), ('G2', 'S'), ('G2', pm),
+        ('well_count', 'W'), ('well_count', 'P'), ('well_count', 'S'), ('well_count', pm),
+        ('W', 'P'), ('W', 'S'), ('W', pm),
+        ('P', 'S'),
+        (pm, 'S'),
     ])
 
     # Step 1: Path a (W → P) using DoWhy
@@ -128,14 +132,14 @@ def calculate_mediation_effects_dowhy(data):
         a_coef_dowhy = estimate_a.value
 
         # Get p-value from statsmodels for path a
-        X_a = sm.add_constant(data[['W', 'G1', 'G2', 'well_count']])
+        X_a = sm.add_constant(data[['W', 'G1', 'G2', 'well_count', P_MISSING_COL]])
         model_a_sm = sm.OLS(data['P'], X_a).fit()
         a_pval = model_a_sm.pvalues['W']
 
     except Exception as e:
         print(f"Warning: DoWhy path a estimation failed: {e}")
         # Fallback to statsmodels
-        model_a_sm = sm.OLS(data['P'], sm.add_constant(data[['W', 'G1', 'G2', 'well_count']])).fit()
+        model_a_sm = sm.OLS(data['P'], sm.add_constant(data[['W', 'G1', 'G2', 'well_count', P_MISSING_COL]])).fit()
         a_coef_dowhy = model_a_sm.params['W']
         a_pval = model_a_sm.pvalues['W']
 
@@ -152,14 +156,14 @@ def calculate_mediation_effects_dowhy(data):
         b_coef_dowhy = estimate_b.value
 
         # Get p-value from statsmodels for path b
-        X_b = sm.add_constant(data[['P', 'W', 'G1', 'G2', 'well_count']])
+        X_b = sm.add_constant(data[['P', 'W', 'G1', 'G2', 'well_count', P_MISSING_COL]])
         model_b_sm = sm.OLS(data['S'], X_b).fit()
         b_pval = model_b_sm.pvalues['P']
 
     except Exception as e:
         print(f"Warning: DoWhy path b estimation failed: {e}")
         # Fallback to statsmodels
-        model_b_sm = sm.OLS(data['S'], sm.add_constant(data[['P', 'W', 'G1', 'G2', 'well_count']])).fit()
+        model_b_sm = sm.OLS(data['S'], sm.add_constant(data[['P', 'W', 'G1', 'G2', 'well_count', P_MISSING_COL]])).fit()
         b_coef_dowhy = model_b_sm.params['P']
         b_pval = model_b_sm.pvalues['P']
 
@@ -176,7 +180,7 @@ def calculate_mediation_effects_dowhy(data):
         c_coef_dowhy = estimate_c.value
 
         # Get p-value and R² from statsmodels for total effect
-        X_c = sm.add_constant(data[['W', 'G1', 'G2', 'well_count']])
+        X_c = sm.add_constant(data[['W', 'G1', 'G2', 'well_count', P_MISSING_COL]])
         model_c_sm = sm.OLS(data['S'], X_c).fit()
         c_pval = model_c_sm.pvalues['W']
         model_c_r2 = model_c_sm.rsquared
@@ -184,13 +188,13 @@ def calculate_mediation_effects_dowhy(data):
     except Exception as e:
         print(f"Warning: DoWhy total effect estimation failed: {e}")
         # Fallback to statsmodels
-        model_c_sm = sm.OLS(data['S'], sm.add_constant(data[['W', 'G1', 'G2', 'well_count']])).fit()
+        model_c_sm = sm.OLS(data['S'], sm.add_constant(data[['W', 'G1', 'G2', 'well_count', P_MISSING_COL]])).fit()
         c_coef_dowhy = model_c_sm.params['W']
         c_pval = model_c_sm.pvalues['W']
         model_c_r2 = model_c_sm.rsquared
 
     # Step 4: Direct effect (W → S | P) - use statsmodels for consistency
-    model_direct = sm.OLS(data['S'], sm.add_constant(data[['P', 'W', 'G1', 'G2', 'well_count']])).fit()
+    model_direct = sm.OLS(data['S'], sm.add_constant(data[['P', 'W', 'G1', 'G2', 'well_count', P_MISSING_COL]])).fit()
     c_prime_coef = model_direct.params['W']
     c_prime_pval = model_direct.pvalues['W']
 
@@ -248,12 +252,13 @@ def bootstrap_mediation_effects_dowhy(data, n_bootstrap=100):
 def run_dowhy_refutations(data):
     """Run DoWhy refutation tests on the aggregated event-level data"""
     try:
-        # Build the causal DAG
+        pm = P_MISSING_COL
         G = nx.DiGraph([
-            ('G1', 'W'), ('G1', 'P'), ('G1', 'S'),
-            ('G2', 'W'), ('G2', 'P'), ('G2', 'S'),
-            ('well_count', 'W'), ('well_count', 'P'), ('well_count', 'S'),
-            ('W', 'P'), ('P', 'S'), ('W', 'S'),
+            ('G1', 'W'), ('G1', 'P'), ('G1', 'S'), ('G1', pm),
+            ('G2', 'W'), ('G2', 'P'), ('G2', 'S'), ('G2', pm),
+            ('well_count', 'W'), ('well_count', 'P'), ('well_count', 'S'), ('well_count', pm),
+            ('W', 'P'), ('P', 'S'), ('W', 'S'), ('W', pm),
+            (pm, 'S'),
         ])
 
         # Total effect model for refutations
@@ -314,7 +319,7 @@ def run_dowhy_refutations(data):
 def calculate_predictive_r2(data):
     """Calculate predictive R² with log transformation for event-level data"""
     try:
-        X = data[['W', 'P', 'G1', 'G2', 'well_count']].copy()
+        X = data[['W', 'P', 'G1', 'G2', 'well_count', P_MISSING_COL]].copy()
         X['W'] = np.log1p(X['W'].clip(lower=0))  # Log transform volumes (non-negative)
         X['well_count'] = np.log1p(X['well_count'].clip(lower=0))  # Log transform well count
         y = data['S']
@@ -336,6 +341,98 @@ def calculate_predictive_r2(data):
     except Exception as e:
         print(f"Warning: Predictive R² calculation failed: {e}")
         return {'predictive_r2': np.nan, 'rmse': np.nan}
+
+
+# =============================================================================
+# CHANGE 7: Hurdle model — two-stage framework separating occurrence from magnitude
+# =============================================================================
+
+def fit_hurdle_model(data):
+    """CHANGE 7: Two-stage hurdle model for event-level aggregated data.
+
+    Identical logic to the well-level version in dowhy_ci.py. At event level,
+    S is magnitude aggregated per event, so S > 0 identifies events with a
+    detected earthquake. Non-event control rows have S = 0.
+
+    Stage 1: GBM binary classifier predicts P(S > 0) using W, P, G1, G2,
+             P_missing, well_count.
+    Stage 2: GBM regressor predicts magnitude conditional on S > 0.
+
+    Formation depth (shallow vs. Ellenburger) is a known missing confounder
+    for Stage 1 — not available in RRC data without external well records.
+    """
+    _nan_result = {
+        'hurdle_occurrence_prob': np.nan,
+        'hurdle_conditional_magnitude': np.nan,
+        'hurdle_stage1_auc': np.nan,
+        'hurdle_stage2_mae': np.nan,
+    }
+
+    try:
+        feature_cols = [c for c in ['W', 'P', 'G1', 'G2', 'well_count', P_MISSING_COL]
+                        if c in data.columns]
+        X = data[feature_cols].copy()
+        S_binary = (data['S'] > 0).astype(int)
+        S_magnitude = data['S'].copy()
+
+        if S_binary.nunique() < 2:
+            print("  ⚠️  Hurdle Stage 1: only one class in S_binary — skipping.")
+            return _nan_result
+
+        from sklearn.model_selection import train_test_split
+        x_tr, x_te, yb_tr, yb_te, ym_tr, ym_te = train_test_split(
+            X, S_binary, S_magnitude, test_size=0.20, random_state=42, shuffle=True
+        )
+
+        # Stage 1 — binary occurrence classifier
+        clf = GradientBoostingClassifier(n_estimators=100, random_state=42)
+        clf.fit(x_tr, yb_tr)
+        occ_prob = clf.predict_proba(x_te)[:, 1]
+        stage1_auc = float(roc_auc_score(yb_te, occ_prob)) if yb_te.nunique() > 1 else np.nan
+
+        # Stage 2 — conditional magnitude regression (events only)
+        event_idx_tr = yb_tr[yb_tr == 1].index
+        event_idx_te = yb_te[yb_te == 1].index
+
+        if len(event_idx_tr) < 10:
+            print(f"  ⚠️  Hurdle Stage 2: only {len(event_idx_tr)} event rows in train — skipping Stage 2.")
+            return {
+                'hurdle_occurrence_prob': float(occ_prob.mean()),
+                'hurdle_conditional_magnitude': np.nan,
+                'hurdle_stage1_auc': stage1_auc,
+                'hurdle_stage2_mae': np.nan,
+            }
+
+        reg = GradientBoostingRegressor(n_estimators=100, random_state=42)
+        reg.fit(x_tr.loc[event_idx_tr], ym_tr.loc[event_idx_tr])
+
+        if len(event_idx_te) > 0:
+            mag_pred = reg.predict(x_te.loc[event_idx_te])
+            stage2_mae = float(mean_absolute_error(ym_te.loc[event_idx_te], mag_pred))
+            cond_mag = float(mag_pred.mean())
+        else:
+            stage2_mae = np.nan
+            cond_mag = np.nan
+
+        cond_str = f"{cond_mag:.3f}" if cond_mag is not None and not np.isnan(cond_mag) else "n/a"
+        mae_str = f"{stage2_mae:.3f}" if stage2_mae is not None and not np.isnan(stage2_mae) else "n/a"
+        print(f"  ✅ Hurdle model: P(occur)={float(occ_prob.mean()):.3f}, "
+              f"AUC={stage1_auc:.3f}, E[mag|occur]={cond_str}, Stage2 MAE={mae_str}")
+
+        return {
+            'hurdle_occurrence_prob': float(occ_prob.mean()),
+            'hurdle_conditional_magnitude': cond_mag,
+            'hurdle_stage1_auc': stage1_auc,
+            'hurdle_stage2_mae': stage2_mae,
+        }
+
+    except Exception as e:
+        print(f"  Warning: Hurdle model failed: {e}")
+        return _nan_result
+
+# =============================================================================
+# END CHANGE 7
+# =============================================================================
 
 
 def process_file(csv_file):
@@ -377,6 +474,10 @@ def process_file(csv_file):
         rename_map = {found[k]: safe(k) for k in found}
         df = df_raw[list(found.values())].rename(columns=rename_map)
 
+        p_col = safe("P")
+        df[P_MISSING_COL] = df[p_col].isna().astype(np.float64)
+        df[p_col] = df[p_col].fillna(0.0)
+
         print(f"Raw data before aggregation: {len(df):,} rows")
 
         # ═══ AGGREGATE BY EVENT ID ═══
@@ -389,6 +490,7 @@ def process_file(csv_file):
             .agg({
                 safe("W"): "sum",  # Sum of injection volumes
                 safe("P"): "median",  # Median injection pressure
+                P_MISSING_COL: "mean",  # Fraction of wells with missing pressure
                 safe("G1"): "min",  # Min nearest fault distance
                 safe("G2"): "sum",  # Sum of fault segments
                 safe("S"): "first",  # Magnitude (same within event)
@@ -412,12 +514,13 @@ def process_file(csv_file):
             print("❌ No events retain both treatment and outcome")
             return None
 
-        # Median-fill missing values in covariates
-        covariates = [c for c in [safe("P"), safe("G1"), safe("G2"), "well_count"]
+        covariates = [c for c in [safe("P"), P_MISSING_COL, safe("G1"), safe("G2"), "well_count"]
                       if c in aggregated.columns]
-        aggregated[covariates] = aggregated[covariates].fillna(
-            aggregated[covariates].median(numeric_only=True)
-        )
+        covariates_median = [c for c in covariates if c not in (safe("P"), P_MISSING_COL)]
+        if covariates_median:
+            aggregated[covariates_median] = aggregated[covariates_median].fillna(
+                aggregated[covariates_median].median(numeric_only=True)
+            )
 
         # Rename columns to standard names
         data = aggregated.rename(columns={
@@ -425,10 +528,11 @@ def process_file(csv_file):
             safe("P"): "P",
             safe("S"): "S",
             safe("G1"): "G1",
-            safe("G2"): "G2"
+            safe("G2"): "G2",
         })
 
         print(f"✅ Clean aggregated data: {len(data):,} events (dropped {rows_before - rows_after:,})")
+        print(f"   Mean fraction wells with missing pressure: {100.0 * data[P_MISSING_COL].mean():.2f}%")
         print(f"   Average wells per event: {data['well_count'].mean():.1f}")
 
         # Calculate DoWhy mediation effects
@@ -447,12 +551,17 @@ def process_file(csv_file):
         print("🔄 Calculating predictive metrics...")
         pred_metrics = calculate_predictive_r2(data)
 
+        # --- CHANGE 7: Hurdle model ---
+        print("🔄 Fitting hurdle model (Change 7)...")
+        hurdle = fit_hurdle_model(data)
+        # --- END CHANGE 7 ---
+
         # Calculate VIFs (including well_count)
-        X_a = sm.add_constant(data[['W', 'G1', 'G2', 'well_count']])
+        X_a = sm.add_constant(data[['W', 'G1', 'G2', 'well_count', P_MISSING_COL]])
         vif_a = calculate_vif(X_a)
         vif_a_avg = vif_a['VIF'].mean()
 
-        X_b = sm.add_constant(data[['W', 'P', 'G1', 'G2', 'well_count']])
+        X_b = sm.add_constant(data[['W', 'P', 'G1', 'G2', 'well_count', P_MISSING_COL]])
         vif_b = calculate_vif(X_b)
         vif_b_avg = vif_b['VIF'].mean()
 
@@ -498,7 +607,13 @@ def process_file(csv_file):
             'placebo_effect': refutations['placebo_effect'],
             'subset_effect': refutations['subset_effect'],
             'random_confounder_effect': refutations['random_confounder_effect'],
-            'dowhy_original_effect': refutations['original_effect']
+            'dowhy_original_effect': refutations['original_effect'],
+            'pressure_missing_pct': 100.0 * float(data[P_MISSING_COL].mean()),
+            # CHANGE 7: hurdle model outputs
+            'hurdle_occurrence_prob': hurdle['hurdle_occurrence_prob'],
+            'hurdle_conditional_magnitude': hurdle['hurdle_conditional_magnitude'],
+            'hurdle_stage1_auc': hurdle['hurdle_stage1_auc'],
+            'hurdle_stage2_mae': hurdle['hurdle_stage2_mae'],
         }
 
     except Exception as e:

@@ -5,7 +5,7 @@ Batch Flexible-Header Causal Analysis **with Mediation**
 * Processes multiple event_well_links_with_faults_<R>km.csv files
 * Prints a mapping-table **and** a missing-value summary for each file
 * Retains only rows containing both treatment (W) **and** outcome (S)
-* Median-fills any remaining NA values in covariates (edit to change)
+* Zero-fills missing mediator pressure P; adds P_missing; median-fills only G1/G2
 * Carries out a formal mediation analysis for the W → P → S pathway
 * Uses "timed banners" so the console never looks frozen
 * Saves results for each radius to a summary CSV file
@@ -57,6 +57,9 @@ CSV_FILES = [
 
 # Summary results file
 RESULTS_CSV = "causal_analysis_results_by_radius.csv"
+
+# Change 6: pressure missingness — zero-fill P and control for P_missing (not median P).
+P_MISSING_COL = "P_missing"
 
 # 1 ▸ COLUMN-NAME FRAGMENTS  (edit if your headers differ) ─────
 COL_FRAGS = {
@@ -133,6 +136,11 @@ def process_file(csv_file: str) -> dict:
     rename_map = {found[k]: safe(k) for k in found}
     df = df_raw[list(found.values())].rename(columns=rename_map)
 
+    # Change 6: P_missing from raw P, then zero-fill P (do not median-impute pressure)
+    p_col = safe("P")
+    df[P_MISSING_COL] = df[p_col].isna().astype(np.float64)
+    df[p_col] = df[p_col].fillna(0.0)
+
     # Keep only rows with non-NA treatment **and** outcome
     essential = [safe("W"), safe("S")]
     rows_before = len(df)
@@ -141,25 +149,27 @@ def process_file(csv_file: str) -> dict:
     rows_dropped = rows_before - rows_after
     print(f"Dropped {rows_dropped:,} rows missing treatment or outcome ({rows_dropped / rows_before:.1%})")
 
-    # Median-fill missing values in covariates
-    covariates = [safe(c) for c in ["P", "G1", "G2"] if safe(c) in df.columns]
-    df[covariates] = df[covariates].fillna(df[covariates].median(numeric_only=True))
+    geo_cov = [safe(c) for c in ["G1", "G2"] if safe(c) in df.columns]
+    if geo_cov:
+        df[geo_cov] = df[geo_cov].fillna(df[geo_cov].median(numeric_only=True))
 
     # Abort if nothing left
     if df.empty:
         print("\n❌  No rows retain both treatment and outcome — skipping file.")
         return None
     W, P, S, G1, G2 = map(safe, ["W", "P", "S", "G1", "G2"])  # Shorthand vars
+    PM = P_MISSING_COL
     print("✅  Rows after cleaning:", len(df))
+    print(f"   Fraction rows with missing pressure (pre-zero-fill): {df[PM].mean():.1%}")
 
     # 4 ▸ BUILD DAG ------------------------------------------------
     G = nx.DiGraph(
         [
-            (G1, W), (G1, P), (G1, S),  # Confounder paths from G1
-            (G2, W), (G2, P), (G2, S),  # Confounder paths from G2
-            (W, P),  # Treatment → Mediator
-            (P, S),  # Mediator  → Outcome
-            (W, S),  # Direct Treatment → Outcome
+            (G1, W), (G1, P), (G1, S), (G1, PM),
+            (G2, W), (G2, P), (G2, S), (G2, PM),
+            (W, P), (W, S), (W, PM),
+            (P, S),
+            (PM, S),
         ]
     )
 
@@ -234,7 +244,7 @@ def process_file(csv_file: str) -> dict:
 
     # 7 ▸ PREDICTIVE SANITY CHECK  --------------------------------
     with step("Training predictive sanity-check model"):
-        X = df[[W, P, G1, G2]].copy()  # Feature matrix for a quick prediction test
+        X = df[[W, P, G1, G2, PM]].copy()  # Feature matrix for a quick prediction test
         X[W] = np.log1p(X[W])  # Mild log-transform of volumes
         y = df[S]  # Target = magnitude
         x_tr, x_te, y_tr, y_te = train_test_split(
