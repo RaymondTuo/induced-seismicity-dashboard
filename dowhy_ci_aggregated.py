@@ -4,7 +4,8 @@ import warnings
 from sklearn.utils import resample
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, roc_auc_score
+from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor
 import statsmodels.api as sm
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from dowhy import CausalModel
@@ -342,6 +343,98 @@ def calculate_predictive_r2(data):
         return {'predictive_r2': np.nan, 'rmse': np.nan}
 
 
+# =============================================================================
+# CHANGE 7: Hurdle model — two-stage framework separating occurrence from magnitude
+# =============================================================================
+
+def fit_hurdle_model(data):
+    """CHANGE 7: Two-stage hurdle model for event-level aggregated data.
+
+    Identical logic to the well-level version in dowhy_ci.py. At event level,
+    S is magnitude aggregated per event, so S > 0 identifies events with a
+    detected earthquake. Non-event control rows have S = 0.
+
+    Stage 1: GBM binary classifier predicts P(S > 0) using W, P, G1, G2,
+             P_missing, well_count.
+    Stage 2: GBM regressor predicts magnitude conditional on S > 0.
+
+    Formation depth (shallow vs. Ellenburger) is a known missing confounder
+    for Stage 1 — not available in RRC data without external well records.
+    """
+    _nan_result = {
+        'hurdle_occurrence_prob': np.nan,
+        'hurdle_conditional_magnitude': np.nan,
+        'hurdle_stage1_auc': np.nan,
+        'hurdle_stage2_mae': np.nan,
+    }
+
+    try:
+        feature_cols = [c for c in ['W', 'P', 'G1', 'G2', 'well_count', P_MISSING_COL]
+                        if c in data.columns]
+        X = data[feature_cols].copy()
+        S_binary = (data['S'] > 0).astype(int)
+        S_magnitude = data['S'].copy()
+
+        if S_binary.nunique() < 2:
+            print("  ⚠️  Hurdle Stage 1: only one class in S_binary — skipping.")
+            return _nan_result
+
+        from sklearn.model_selection import train_test_split
+        x_tr, x_te, yb_tr, yb_te, ym_tr, ym_te = train_test_split(
+            X, S_binary, S_magnitude, test_size=0.20, random_state=42, shuffle=True
+        )
+
+        # Stage 1 — binary occurrence classifier
+        clf = GradientBoostingClassifier(n_estimators=100, random_state=42)
+        clf.fit(x_tr, yb_tr)
+        occ_prob = clf.predict_proba(x_te)[:, 1]
+        stage1_auc = float(roc_auc_score(yb_te, occ_prob)) if yb_te.nunique() > 1 else np.nan
+
+        # Stage 2 — conditional magnitude regression (events only)
+        event_idx_tr = yb_tr[yb_tr == 1].index
+        event_idx_te = yb_te[yb_te == 1].index
+
+        if len(event_idx_tr) < 10:
+            print(f"  ⚠️  Hurdle Stage 2: only {len(event_idx_tr)} event rows in train — skipping Stage 2.")
+            return {
+                'hurdle_occurrence_prob': float(occ_prob.mean()),
+                'hurdle_conditional_magnitude': np.nan,
+                'hurdle_stage1_auc': stage1_auc,
+                'hurdle_stage2_mae': np.nan,
+            }
+
+        reg = GradientBoostingRegressor(n_estimators=100, random_state=42)
+        reg.fit(x_tr.loc[event_idx_tr], ym_tr.loc[event_idx_tr])
+
+        if len(event_idx_te) > 0:
+            mag_pred = reg.predict(x_te.loc[event_idx_te])
+            stage2_mae = float(mean_absolute_error(ym_te.loc[event_idx_te], mag_pred))
+            cond_mag = float(mag_pred.mean())
+        else:
+            stage2_mae = np.nan
+            cond_mag = np.nan
+
+        cond_str = f"{cond_mag:.3f}" if cond_mag is not None and not np.isnan(cond_mag) else "n/a"
+        mae_str = f"{stage2_mae:.3f}" if stage2_mae is not None and not np.isnan(stage2_mae) else "n/a"
+        print(f"  ✅ Hurdle model: P(occur)={float(occ_prob.mean()):.3f}, "
+              f"AUC={stage1_auc:.3f}, E[mag|occur]={cond_str}, Stage2 MAE={mae_str}")
+
+        return {
+            'hurdle_occurrence_prob': float(occ_prob.mean()),
+            'hurdle_conditional_magnitude': cond_mag,
+            'hurdle_stage1_auc': stage1_auc,
+            'hurdle_stage2_mae': stage2_mae,
+        }
+
+    except Exception as e:
+        print(f"  Warning: Hurdle model failed: {e}")
+        return _nan_result
+
+# =============================================================================
+# END CHANGE 7
+# =============================================================================
+
+
 def process_file(csv_file):
     """Process a single file and return results"""
     print(f"\n{'=' * 60}")
@@ -458,6 +551,11 @@ def process_file(csv_file):
         print("🔄 Calculating predictive metrics...")
         pred_metrics = calculate_predictive_r2(data)
 
+        # --- CHANGE 7: Hurdle model ---
+        print("🔄 Fitting hurdle model (Change 7)...")
+        hurdle = fit_hurdle_model(data)
+        # --- END CHANGE 7 ---
+
         # Calculate VIFs (including well_count)
         X_a = sm.add_constant(data[['W', 'G1', 'G2', 'well_count', P_MISSING_COL]])
         vif_a = calculate_vif(X_a)
@@ -511,6 +609,11 @@ def process_file(csv_file):
             'random_confounder_effect': refutations['random_confounder_effect'],
             'dowhy_original_effect': refutations['original_effect'],
             'pressure_missing_pct': 100.0 * float(data[P_MISSING_COL].mean()),
+            # CHANGE 7: hurdle model outputs
+            'hurdle_occurrence_prob': hurdle['hurdle_occurrence_prob'],
+            'hurdle_conditional_magnitude': hurdle['hurdle_conditional_magnitude'],
+            'hurdle_stage1_auc': hurdle['hurdle_stage1_auc'],
+            'hurdle_stage2_mae': hurdle['hurdle_stage2_mae'],
         }
 
     except Exception as e:
