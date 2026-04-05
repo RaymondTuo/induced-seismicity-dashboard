@@ -45,6 +45,9 @@ if not any(f.endswith('.csv') for f in os.listdir('.') if os.path.isfile(f)):
 
 print("\nLooking for data files...")
 
+# Change 6: zero-fill P at well level; aggregate P_missing as fraction per event
+P_MISSING_COL = "P_missing"
+
 
 def find_csv_files():
     csv_files = []
@@ -105,14 +108,14 @@ def calculate_mediation_effects_dowhy(data):
 
     data = data.copy().reset_index(drop=True)
 
-    # Build the causal DAG including well_count as an additional confounder
+    pm = P_MISSING_COL
     G = nx.DiGraph([
-        ('G1', 'W'), ('G1', 'P'), ('G1', 'S'),  # Confounder paths from G1
-        ('G2', 'W'), ('G2', 'P'), ('G2', 'S'),  # Confounder paths from G2
-        ('well_count', 'W'), ('well_count', 'P'), ('well_count', 'S'),  # Well count confounding
-        ('W', 'P'),  # Treatment → Mediator
-        ('P', 'S'),  # Mediator  → Outcome
-        ('W', 'S'),  # Direct Treatment → Outcome
+        ('G1', 'W'), ('G1', 'P'), ('G1', 'S'), ('G1', pm),
+        ('G2', 'W'), ('G2', 'P'), ('G2', 'S'), ('G2', pm),
+        ('well_count', 'W'), ('well_count', 'P'), ('well_count', 'S'), ('well_count', pm),
+        ('W', 'P'), ('W', 'S'), ('W', pm),
+        ('P', 'S'),
+        (pm, 'S'),
     ])
 
     # Step 1: Path a (W → P) using DoWhy
@@ -128,14 +131,14 @@ def calculate_mediation_effects_dowhy(data):
         a_coef_dowhy = estimate_a.value
 
         # Get p-value from statsmodels for path a
-        X_a = sm.add_constant(data[['W', 'G1', 'G2', 'well_count']])
+        X_a = sm.add_constant(data[['W', 'G1', 'G2', 'well_count', P_MISSING_COL]])
         model_a_sm = sm.OLS(data['P'], X_a).fit()
         a_pval = model_a_sm.pvalues['W']
 
     except Exception as e:
         print(f"Warning: DoWhy path a estimation failed: {e}")
         # Fallback to statsmodels
-        model_a_sm = sm.OLS(data['P'], sm.add_constant(data[['W', 'G1', 'G2', 'well_count']])).fit()
+        model_a_sm = sm.OLS(data['P'], sm.add_constant(data[['W', 'G1', 'G2', 'well_count', P_MISSING_COL]])).fit()
         a_coef_dowhy = model_a_sm.params['W']
         a_pval = model_a_sm.pvalues['W']
 
@@ -152,14 +155,14 @@ def calculate_mediation_effects_dowhy(data):
         b_coef_dowhy = estimate_b.value
 
         # Get p-value from statsmodels for path b
-        X_b = sm.add_constant(data[['P', 'W', 'G1', 'G2', 'well_count']])
+        X_b = sm.add_constant(data[['P', 'W', 'G1', 'G2', 'well_count', P_MISSING_COL]])
         model_b_sm = sm.OLS(data['S'], X_b).fit()
         b_pval = model_b_sm.pvalues['P']
 
     except Exception as e:
         print(f"Warning: DoWhy path b estimation failed: {e}")
         # Fallback to statsmodels
-        model_b_sm = sm.OLS(data['S'], sm.add_constant(data[['P', 'W', 'G1', 'G2', 'well_count']])).fit()
+        model_b_sm = sm.OLS(data['S'], sm.add_constant(data[['P', 'W', 'G1', 'G2', 'well_count', P_MISSING_COL]])).fit()
         b_coef_dowhy = model_b_sm.params['P']
         b_pval = model_b_sm.pvalues['P']
 
@@ -176,7 +179,7 @@ def calculate_mediation_effects_dowhy(data):
         c_coef_dowhy = estimate_c.value
 
         # Get p-value and R² from statsmodels for total effect
-        X_c = sm.add_constant(data[['W', 'G1', 'G2', 'well_count']])
+        X_c = sm.add_constant(data[['W', 'G1', 'G2', 'well_count', P_MISSING_COL]])
         model_c_sm = sm.OLS(data['S'], X_c).fit()
         c_pval = model_c_sm.pvalues['W']
         model_c_r2 = model_c_sm.rsquared
@@ -184,13 +187,13 @@ def calculate_mediation_effects_dowhy(data):
     except Exception as e:
         print(f"Warning: DoWhy total effect estimation failed: {e}")
         # Fallback to statsmodels
-        model_c_sm = sm.OLS(data['S'], sm.add_constant(data[['W', 'G1', 'G2', 'well_count']])).fit()
+        model_c_sm = sm.OLS(data['S'], sm.add_constant(data[['W', 'G1', 'G2', 'well_count', P_MISSING_COL]])).fit()
         c_coef_dowhy = model_c_sm.params['W']
         c_pval = model_c_sm.pvalues['W']
         model_c_r2 = model_c_sm.rsquared
 
     # Step 4: Direct effect (W → S | P) - use statsmodels for consistency
-    model_direct = sm.OLS(data['S'], sm.add_constant(data[['P', 'W', 'G1', 'G2', 'well_count']])).fit()
+    model_direct = sm.OLS(data['S'], sm.add_constant(data[['P', 'W', 'G1', 'G2', 'well_count', P_MISSING_COL]])).fit()
     c_prime_coef = model_direct.params['W']
     c_prime_pval = model_direct.pvalues['W']
 
@@ -248,12 +251,13 @@ def bootstrap_mediation_effects_dowhy(data, n_bootstrap=100):
 def run_dowhy_refutations(data):
     """Run DoWhy refutation tests on the aggregated event-level data"""
     try:
-        # Build the causal DAG
+        pm = P_MISSING_COL
         G = nx.DiGraph([
-            ('G1', 'W'), ('G1', 'P'), ('G1', 'S'),
-            ('G2', 'W'), ('G2', 'P'), ('G2', 'S'),
-            ('well_count', 'W'), ('well_count', 'P'), ('well_count', 'S'),
-            ('W', 'P'), ('P', 'S'), ('W', 'S'),
+            ('G1', 'W'), ('G1', 'P'), ('G1', 'S'), ('G1', pm),
+            ('G2', 'W'), ('G2', 'P'), ('G2', 'S'), ('G2', pm),
+            ('well_count', 'W'), ('well_count', 'P'), ('well_count', 'S'), ('well_count', pm),
+            ('W', 'P'), ('P', 'S'), ('W', 'S'), ('W', pm),
+            (pm, 'S'),
         ])
 
         # Total effect model for refutations
@@ -314,7 +318,7 @@ def run_dowhy_refutations(data):
 def calculate_predictive_r2(data):
     """Calculate predictive R² with log transformation for event-level data"""
     try:
-        X = data[['W', 'P', 'G1', 'G2', 'well_count']].copy()
+        X = data[['W', 'P', 'G1', 'G2', 'well_count', P_MISSING_COL]].copy()
         X['W'] = np.log1p(X['W'].clip(lower=0))  # Log transform volumes (non-negative)
         X['well_count'] = np.log1p(X['well_count'].clip(lower=0))  # Log transform well count
         y = data['S']
@@ -377,6 +381,10 @@ def process_file(csv_file):
         rename_map = {found[k]: safe(k) for k in found}
         df = df_raw[list(found.values())].rename(columns=rename_map)
 
+        p_col = safe("P")
+        df[P_MISSING_COL] = df[p_col].isna().astype(np.float64)
+        df[p_col] = df[p_col].fillna(0.0)
+
         print(f"Raw data before aggregation: {len(df):,} rows")
 
         # ═══ AGGREGATE BY EVENT ID ═══
@@ -389,6 +397,7 @@ def process_file(csv_file):
             .agg({
                 safe("W"): "sum",  # Sum of injection volumes
                 safe("P"): "median",  # Median injection pressure
+                P_MISSING_COL: "mean",  # Fraction of wells with missing pressure
                 safe("G1"): "min",  # Min nearest fault distance
                 safe("G2"): "sum",  # Sum of fault segments
                 safe("S"): "first",  # Magnitude (same within event)
@@ -412,12 +421,13 @@ def process_file(csv_file):
             print("❌ No events retain both treatment and outcome")
             return None
 
-        # Median-fill missing values in covariates
-        covariates = [c for c in [safe("P"), safe("G1"), safe("G2"), "well_count"]
+        covariates = [c for c in [safe("P"), P_MISSING_COL, safe("G1"), safe("G2"), "well_count"]
                       if c in aggregated.columns]
-        aggregated[covariates] = aggregated[covariates].fillna(
-            aggregated[covariates].median(numeric_only=True)
-        )
+        covariates_median = [c for c in covariates if c not in (safe("P"), P_MISSING_COL)]
+        if covariates_median:
+            aggregated[covariates_median] = aggregated[covariates_median].fillna(
+                aggregated[covariates_median].median(numeric_only=True)
+            )
 
         # Rename columns to standard names
         data = aggregated.rename(columns={
@@ -425,10 +435,11 @@ def process_file(csv_file):
             safe("P"): "P",
             safe("S"): "S",
             safe("G1"): "G1",
-            safe("G2"): "G2"
+            safe("G2"): "G2",
         })
 
         print(f"✅ Clean aggregated data: {len(data):,} events (dropped {rows_before - rows_after:,})")
+        print(f"   Mean fraction wells with missing pressure: {100.0 * data[P_MISSING_COL].mean():.2f}%")
         print(f"   Average wells per event: {data['well_count'].mean():.1f}")
 
         # Calculate DoWhy mediation effects
@@ -448,11 +459,11 @@ def process_file(csv_file):
         pred_metrics = calculate_predictive_r2(data)
 
         # Calculate VIFs (including well_count)
-        X_a = sm.add_constant(data[['W', 'G1', 'G2', 'well_count']])
+        X_a = sm.add_constant(data[['W', 'G1', 'G2', 'well_count', P_MISSING_COL]])
         vif_a = calculate_vif(X_a)
         vif_a_avg = vif_a['VIF'].mean()
 
-        X_b = sm.add_constant(data[['W', 'P', 'G1', 'G2', 'well_count']])
+        X_b = sm.add_constant(data[['W', 'P', 'G1', 'G2', 'well_count', P_MISSING_COL]])
         vif_b = calculate_vif(X_b)
         vif_b_avg = vif_b['VIF'].mean()
 
@@ -498,7 +509,8 @@ def process_file(csv_file):
             'placebo_effect': refutations['placebo_effect'],
             'subset_effect': refutations['subset_effect'],
             'random_confounder_effect': refutations['random_confounder_effect'],
-            'dowhy_original_effect': refutations['original_effect']
+            'dowhy_original_effect': refutations['original_effect'],
+            'pressure_missing_pct': 100.0 * float(data[P_MISSING_COL].mean()),
         }
 
     except Exception as e:
