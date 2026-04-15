@@ -6,7 +6,8 @@ All notable changes to the induced seismicity causal inference pipeline and dash
 
 ## Change 7 — 90-Day Lookback Remodel (2026-04-05)
 
-**Contributors:** Vivek Sriram, Raymond Tuo (PR #1)
+**Contributors:** 
+
 
 - Merged [RaymondTuo/90-day-lookback-remodel](https://github.com/RaymondTuo/90-day-lookback-remodel) via PR #1
 - Extended injection lookback window from 30 days to 90 days across the full pipeline
