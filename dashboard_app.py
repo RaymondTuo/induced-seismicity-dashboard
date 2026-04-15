@@ -184,6 +184,34 @@ def load_spatial_links(lookback_days: int, radius_km: int, max_rows: int = 20000
     return links, f"Spatial source: `{path}`{note} ({len(links):,} rows displayed)"
 
 
+def load_spatial_links_by_radius(radius_km: int, max_rows: int = 20000) -> tuple[pd.DataFrame | None, str]:
+    lookbacks, _ = discover_spatial_index()
+    paths: list[tuple[int, Path]] = []
+    for lb in lookbacks:
+        path = Path(SPATIAL_LINK_TEMPLATE.format(lookback=lb, radius=radius_km))
+        if path.exists():
+            paths.append((lb, path))
+    if not paths:
+        return None, f"Missing spatial files for radius {radius_km} km."
+
+    frames: list[pd.DataFrame] = []
+    for lb, path in paths:
+        frame = pd.read_csv(path, low_memory=False)
+        frame = frame.rename(columns={"API Number": "api_number"})
+        frame["source_lookback_days"] = lb
+        frames.append(frame)
+    links = pd.concat(frames, ignore_index=True)
+    if "EventID" not in links.columns or "api_number" not in links.columns:
+        return None, "Spatial file missing required columns `EventID` and/or `API Number`."
+
+    # Keep one row per event-well pair when multiple lookback exports overlap.
+    links = links.drop_duplicates(subset=["EventID", "api_number"], keep="first")
+    if len(links) > max_rows:
+        links = links.sample(max_rows, random_state=42)
+    used_lookbacks = sorted({lb for lb, _ in paths})
+    return links, f"Spatial sources: radius {radius_km} km across lookbacks {used_lookbacks} ({len(links):,} rows displayed)"
+
+
 def _build_map_points(links: pd.DataFrame) -> pd.DataFrame:
     event_pts = links[["EventID", "api_number", "Latitude (WGS84)", "Longitude (WGS84)", "Local Magnitude"]].copy()
     event_pts = event_pts.rename(columns={"Latitude (WGS84)": "lat", "Longitude (WGS84)": "lon"})
@@ -222,14 +250,11 @@ def main() -> None:
     radius_range = st.sidebar.slider("Radius range (km)", 1, 20, (1, 20))
     models = sorted(df["model_type"].dropna().unique().tolist())
     selected_models = st.sidebar.multiselect("Model types", models, default=models)
-    lookbacks = sorted(df["lookback_days"].dropna().astype(int).unique().tolist())
-    selected_lookback = st.sidebar.selectbox("Lookback window (days)", lookbacks, index=0)
 
     view_df = df[
         (df["radius_km"] >= radius_range[0])
         & (df["radius_km"] <= radius_range[1])
         & (df["model_type"].isin(selected_models))
-        & (df["lookback_days"] == selected_lookback)
     ].copy()
 
     tabs = st.tabs(
@@ -384,78 +409,172 @@ def main() -> None:
 
     with tabs[8]:
         st.subheader("Texas Basin Map: Event-Well Link Explorer")
-        spatial_lookbacks, spatial_radii = discover_spatial_index()
-        map_lb_options = spatial_lookbacks if spatial_lookbacks else lookbacks
+        _, spatial_radii = discover_spatial_index()
         map_radius_options = [r for r in spatial_radii if radius_range[0] <= r <= radius_range[1]] if spatial_radii else list(range(radius_range[0], radius_range[1] + 1))
         if not map_radius_options:
             map_radius_options = list(range(radius_range[0], radius_range[1] + 1))
         c1, c2 = st.columns(2)
         with c1:
-            map_lookback = st.selectbox("Map lookback (days)", map_lb_options, index=0, key="map_lookback")
-        with c2:
             map_radius = st.selectbox("Map radius (km)", map_radius_options, index=0, key="map_radius")
+        with c2:
+            st.caption("Map includes all available lookback exports for this radius.")
 
-        links_df, map_status = load_spatial_links(int(map_lookback), int(map_radius))
+        links_df, map_status = load_spatial_links_by_radius(int(map_radius))
         if links_df is None:
             st.info(map_status)
         else:
             st.caption(map_status)
-            points_df = _build_map_points(links_df)
-            fig_map = px.scatter_mapbox(
-                points_df,
-                lat="lat",
-                lon="lon",
-                color="point_type",
-                hover_name="label",
-                hover_data={"EventID": True, "api_number": True, "metric_value": ":.3f"},
-                custom_data=["point_type", "EventID", "api_number"],
-                zoom=5.2,
-                height=650,
-            )
-            fig_map.update_layout(mapbox_style="open-street-map", margin=dict(l=0, r=0, t=0, b=0), clickmode="event+select")
+            if "Local Magnitude" in links_df.columns and links_df["Local Magnitude"].notna().any():
+                mag_values = links_df["Local Magnitude"].dropna().astype(float)
+                mag_min = float(np.floor(mag_values.min() * 10) / 10)
+                mag_max = float(np.ceil(mag_values.max() * 10) / 10)
+                mag_range = st.slider(
+                    "Event magnitude range",
+                    min_value=mag_min,
+                    max_value=mag_max,
+                    value=(mag_min, mag_max),
+                    step=0.1,
+                )
+                links_df = links_df[
+                    links_df["Local Magnitude"].notna()
+                    & (links_df["Local Magnitude"].astype(float) >= mag_range[0])
+                    & (links_df["Local Magnitude"].astype(float) <= mag_range[1])
+                ].copy()
+            else:
+                st.info("`Local Magnitude` not available in map source; magnitude filter disabled.")
 
-            selected = st.plotly_chart(
-                fig_map,
-                on_select="rerun",
-                selection_mode="points",
-                key="tx_basin_map",
-            )
+            if links_df.empty:
+                st.warning("No event-well links match the selected magnitude range.")
+            else:
+                points_df = _build_map_points(links_df)
+                if "map_selected_event" not in st.session_state:
+                    st.session_state["map_selected_event"] = None
+                if "map_selected_well" not in st.session_state:
+                    st.session_state["map_selected_well"] = None
 
-            if "map_selected_event" not in st.session_state:
-                st.session_state["map_selected_event"] = None
-            if "map_selected_well" not in st.session_state:
-                st.session_state["map_selected_well"] = None
+                event_options = sorted(points_df["EventID"].dropna().astype(str).unique().tolist())
+                well_options = sorted(points_df["api_number"].dropna().astype(str).unique().tolist())
+                picked_event = st.selectbox(
+                    "Selected event (click map or choose here)",
+                    [""] + event_options,
+                    index=0 if not st.session_state["map_selected_event"] else ([""] + event_options).index(str(st.session_state["map_selected_event"])) if str(st.session_state["map_selected_event"]) in event_options else 0,
+                )
+                picked_well = st.selectbox(
+                    "Selected well (click map or choose here)",
+                    [""] + well_options,
+                    index=0 if not st.session_state["map_selected_well"] else ([""] + well_options).index(str(st.session_state["map_selected_well"])) if str(st.session_state["map_selected_well"]) in well_options else 0,
+                )
 
-            if selected and selected.get("selection", {}).get("points"):
-                first = selected["selection"]["points"][0].get("customdata", [])
-                if len(first) >= 3:
-                    p_type, ev_id, api = first[0], first[1], first[2]
-                    if p_type == "Event":
-                        st.session_state["map_selected_event"] = ev_id
-                    elif p_type == "Well":
-                        st.session_state["map_selected_well"] = api
+                # Keep one active focus at a time: event -> linked wells, or well -> linked events.
+                if picked_event:
+                    st.session_state["map_selected_event"] = str(picked_event)
+                    st.session_state["map_selected_well"] = None
+                    picked_well = ""
+                elif picked_well:
+                    st.session_state["map_selected_well"] = str(picked_well)
+                    st.session_state["map_selected_event"] = None
+                    picked_event = ""
+                else:
+                    st.session_state["map_selected_event"] = None
+                    st.session_state["map_selected_well"] = None
 
-            event_options = sorted(points_df["EventID"].dropna().astype(str).unique().tolist())
-            well_options = sorted(points_df["api_number"].dropna().astype(str).unique().tolist())
-            picked_event = st.selectbox(
-                "Selected event (click map or choose here)",
-                [""] + event_options,
-                index=0 if not st.session_state["map_selected_event"] else ([""] + event_options).index(str(st.session_state["map_selected_event"])) if str(st.session_state["map_selected_event"]) in event_options else 0,
-            )
-            picked_well = st.selectbox(
-                "Selected well (click map or choose here)",
-                [""] + well_options,
-                index=0 if not st.session_state["map_selected_well"] else ([""] + well_options).index(str(st.session_state["map_selected_well"])) if str(st.session_state["map_selected_well"]) in well_options else 0,
-            )
+                if picked_event:
+                    linked = links_df[links_df["EventID"].astype(str) == str(picked_event)].copy()
+                    highlight_event_ids = {str(picked_event)}
+                    highlight_well_ids = set(linked["api_number"].astype(str).tolist())
+                elif picked_well:
+                    linked = links_df[links_df["api_number"].astype(str) == str(picked_well)].copy()
+                    highlight_event_ids = set(linked["EventID"].astype(str).tolist())
+                    highlight_well_ids = {str(picked_well)}
+                else:
+                    linked = links_df.copy()
+                    highlight_event_ids = set()
+                    highlight_well_ids = set()
 
-            linked = links_df.copy()
-            if picked_event:
-                linked = linked[linked["EventID"].astype(str) == str(picked_event)]
-            if picked_well:
-                linked = linked[linked["api_number"].astype(str) == str(picked_well)]
-            st.write(f"Associated links found: **{len(linked):,}**")
-            show_cols = [c for c in ["EventID", "api_number", "Local Magnitude", "Vol Prev N (BBLs)", "Distance from Well to Event", "Nearest Fault Dist (km)"] if c in linked.columns]
-            st.dataframe(linked[show_cols].head(500))
+                points_df["highlight_role"] = points_df["point_type"]
+                points_df.loc[
+                    points_df["point_type"].eq("Event") & points_df["EventID"].astype(str).isin(highlight_event_ids),
+                    "highlight_role",
+                ] = "Selected Event"
+                points_df.loc[
+                    points_df["point_type"].eq("Well") & points_df["api_number"].astype(str).isin(highlight_well_ids),
+                    "highlight_role",
+                ] = "Selected Well"
+
+                # Hide non-associated points once an event/well is selected.
+                if picked_event or picked_well:
+                    points_plot = points_df[
+                        (
+                            points_df["point_type"].eq("Event")
+                            & points_df["EventID"].astype(str).isin(highlight_event_ids)
+                        )
+                        | (
+                            points_df["point_type"].eq("Well")
+                            & points_df["api_number"].astype(str).isin(highlight_well_ids)
+                        )
+                    ].copy()
+                else:
+                    points_plot = points_df.copy()
+
+                # Scale event marker size by local magnitude; wells stay fixed size.
+                points_plot["marker_size"] = 9.0
+                event_mask = points_plot["point_type"].eq("Event")
+                if event_mask.any():
+                    event_mag = pd.to_numeric(points_plot.loc[event_mask, "metric_value"], errors="coerce")
+                    if event_mag.notna().any():
+                        mag_min = float(event_mag.min())
+                        mag_max = float(event_mag.max())
+                        if mag_max > mag_min:
+                            norm = (event_mag - mag_min) / (mag_max - mag_min)
+                            scaled = 10 + norm * 14  # 10..24
+                        else:
+                            scaled = pd.Series(16.0, index=event_mag.index)
+                        points_plot.loc[event_mask, "marker_size"] = scaled.fillna(12.0)
+                    else:
+                        points_plot.loc[event_mask, "marker_size"] = 12.0
+
+                fig_map = px.scatter_mapbox(
+                    points_plot,
+                    lat="lat",
+                    lon="lon",
+                    color="highlight_role",
+                    size="marker_size",
+                    size_max=24,
+                    hover_name="label",
+                    hover_data={"EventID": True, "api_number": True, "metric_value": ":.3f", "marker_size": False, "highlight_role": False},
+                    custom_data=["point_type", "EventID", "api_number"],
+                    color_discrete_map={
+                        "Event": "#636EFA",
+                        "Well": "#EF553B",
+                        "Selected Event": "#00CC96",
+                        "Selected Well": "#AB63FA",
+                    },
+                    zoom=5.2,
+                    height=650,
+                )
+                fig_map.update_layout(mapbox_style="open-street-map", margin=dict(l=0, r=0, t=0, b=0), clickmode="event+select")
+                selected = st.plotly_chart(
+                    fig_map,
+                    on_select="rerun",
+                    selection_mode="points",
+                    key="tx_basin_map",
+                    use_container_width=True,
+                )
+
+                if selected and selected.get("selection", {}).get("points"):
+                    first = selected["selection"]["points"][0].get("customdata", [])
+                    if len(first) >= 3:
+                        p_type, ev_id, api = first[0], first[1], first[2]
+                        if p_type == "Event":
+                            st.session_state["map_selected_event"] = str(ev_id)
+                            st.session_state["map_selected_well"] = None
+                        elif p_type == "Well":
+                            st.session_state["map_selected_well"] = str(api)
+                            st.session_state["map_selected_event"] = None
+
+                st.write(f"Associated links found: **{len(linked):,}**")
+                show_cols = [c for c in ["EventID", "api_number", "Local Magnitude", "Vol Prev N (BBLs)", "Distance from Well to Event", "Nearest Fault Dist (km)"] if c in linked.columns]
+                st.dataframe(linked[show_cols].head(500))
 
 
 if __name__ == "__main__":
