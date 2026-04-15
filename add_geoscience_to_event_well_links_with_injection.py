@@ -50,7 +50,7 @@ _TAG = f"{_args.lookback_days}d"
 # ─── USER CONFIG ───────────────────────────────────────────────
 LINKAGE_FILES = [f"combined_event_well_links_{_TAG}_{R}km.csv" for R in range(1, 21)]
 
-FAULT_SHP = "Horne_et_al._2023_MB_BSMT_FSP_V1.shp"
+FAULT_SHP = "data/Horne_et_al._2023_MB_BSMT_FSP_V1.shp"
 
 # Output file templates - {R} will be replaced with the radius value
 OUT_CSV_TEMPLATE     = f"event_well_links_with_faults_{_TAG}_{{R}}km.csv"

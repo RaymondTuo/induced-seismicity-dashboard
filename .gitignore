@@ -1,9 +1,32 @@
 
+# Data files
 *.png
 *.shx
 *.csv
 *.mp4
 
+# IDE / editor
 .idea
+.vscode
+
+# Python environments
 .venv
 
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Log files
+*.log
+_*.log
+
+# Runtime pipeline artifacts
+dag_event_level_*
+dag_radius_*
+checkpoints/
+results/
+pipeline_output_*/
+
+# Generated documents and presentation files (not tracked)
+docs/
