@@ -621,213 +621,258 @@ def process_file(csv_file):
         return None
 
 
-# Find event files
-csv_files = find_csv_files()
-event_files = [f for f in csv_files if 'event_well_links_with_faults' in f]
 
-if not event_files:
-    print("❌ No event files found!")
-    exit(1)
 
-# Sort event files by radius
-event_files.sort(key=lambda x: extract_radius(x))
+def _run_main():
+    """Entry point; wrapped so ProcessPoolExecutor workers do not re-execute it."""
+    # Find event files
+    csv_files = find_csv_files()
+    event_files = [f for f in csv_files if 'event_well_links_with_faults' in f]
 
-print(f"\n🎯 Found {len(event_files)} event files to process:")
-for i, file in enumerate(event_files):
-    radius = extract_radius(file)
-    size = os.path.getsize(file) / (1024 * 1024)
-    print(f"  {i + 1:2d}. {radius:2d}km - {file} ({size:.1f} MB)")
+    if not event_files:
+        print("❌ No event files found!")
+        exit(1)
 
-# Process all files
-print(f"\n{'=' * 80}")
-print("BATCH DOWHY EVENT-LEVEL MEDIATION ANALYSIS WITH BOOTSTRAP CI")
-print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-print(f"{'=' * 80}")
+    # Sort event files by radius
+    event_files.sort(key=lambda x: extract_radius(x))
 
-results = []
-for i, csv_file in enumerate(event_files):
-    print(f"\n[{i + 1}/{len(event_files)}] Processing {csv_file}...")
+    print(f"\n🎯 Found {len(event_files)} event files to process:")
+    for i, file in enumerate(event_files):
+        radius = extract_radius(file)
+        size = os.path.getsize(file) / (1024 * 1024)
+        print(f"  {i + 1:2d}. {radius:2d}km - {file} ({size:.1f} MB)")
 
-    result = process_file(csv_file)
-    if result:
-        results.append(result)
+    # Process all files
+    print(f"\n{'=' * 80}")
+    print("BATCH DOWHY EVENT-LEVEL MEDIATION ANALYSIS WITH BOOTSTRAP CI")
+    print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'=' * 80}")
 
-# Create summary table
-if results:
-    results_df = pd.DataFrame(results).sort_values('radius')
 
-    print(f"\n{'=' * 150}")
-    print("📊 COMPREHENSIVE DOWHY EVENT-LEVEL MEDIATION ANALYSIS SUMMARY")
-    print(f"{'=' * 150}")
+    # --- PARALLEL MIGRATION: applied by migrate_to_parallel.py ---
+    # Distribute radii across worker processes. Each process_file() call is
+    # fully independent (loads its own CSV, uses iteration-indexed bootstrap
+    # seeds), so output is bit-identical to serial execution.
+    import os as _os
+    try:
+        from joblib import Parallel, delayed  # type: ignore
+        _have_joblib = True
+    except ImportError:  # pragma: no cover - fallback if joblib missing
+        _have_joblib = False
 
-    # Main results table
-    print("\n🎯 CAUSAL EFFECTS BY RADIUS (DOWHY EVENT-LEVEL AGGREGATED):")
-    print("─" * 150)
-    print(
-        f"{'Radius':>6} {'Events':>7} {'Avg Wells':>9} {'Total Effect':>13} {'95% CI':>20} {'Direct Effect':>14} {'95% CI':>20} {'Indirect':>11} {'% Med':>6} {'Causal R²':>9} {'Pred R²':>8}")
-    print("─" * 150)
+    _n_jobs_env = _os.environ.get("DOWHY_CI_JOBS", "").strip()
+    try:
+        _n_jobs = int(_n_jobs_env) if _n_jobs_env else 0
+    except ValueError:
+        _n_jobs = 0
+    if _n_jobs <= 0:
+        _cpu = _os.cpu_count() or 1
+        _n_jobs = min(8, len(event_files), max(1, _cpu - 1))
 
-    for _, row in results_df.iterrows():
-        print(f"{row['radius']:>4}km {row['n_events']:>7,} "
-              f"{row['avg_well_count']:>8.1f} "
-              f"{row['total_effect']:>+10.3e} "
-              f"[{row['total_ci_low']:>+7.2e},{row['total_ci_high']:>+7.2e}] "
-              f"{row['direct_effect']:>+11.3e} "
-              f"[{row['direct_ci_low']:>+7.2e},{row['direct_ci_high']:>+7.2e}] "
-              f"{row['indirect_effect']:>+8.2e} "
-              f"{row['prop_mediated']:>5.1f}% "
-              f"{row['causal_r2']:>8.3f} "
-              f"{row['predictive_r2']:>7.3f}")
+    print(f"\n🔀  Parallel execution: {_n_jobs} worker(s) across {len(event_files)} radii "
+          f"(override with DOWHY_CI_JOBS)")
 
-    print("─" * 150)
+    results = []
+    if _have_joblib and _n_jobs > 1:
+        _all = Parallel(n_jobs=_n_jobs, backend="loky", verbose=5)(
+            delayed(process_file)(csv_file) for csv_file in event_files
+        )
+        for file_results in _all:
+            if file_results:
+                # dowhy_ci returns list; dowhy_ci_aggregated returns dict or None.
+                if isinstance(file_results, list):
+                    results.extend(file_results)
+                else:
+                    results.append(file_results)
+    else:
+        for i, csv_file in enumerate(event_files):
+            print(f"\n[{i + 1}/{len(event_files)}] Processing {csv_file}...")
+            file_results = process_file(csv_file)
+            if file_results:
+                if isinstance(file_results, list):
+                    results.extend(file_results)
+                else:
+                    results.append(file_results)
+    # Create summary table
+    if results:
+        results_df = pd.DataFrame(results).sort_values('radius')
 
-    # Statistical significance and quality metrics table
-    print("\n📈 STATISTICAL SIGNIFICANCE & QUALITY METRICS:")
-    print("─" * 120)
-    print(
-        f"{'Radius':>6} {'Total p-val':>12} {'Direct p-val':>13} {'Path a p-val':>13} {'Path b p-val':>13} {'Bootstrap':>10} {'VIF':>6}")
-    print("─" * 120)
+        print(f"\n{'=' * 150}")
+        print("📊 COMPREHENSIVE DOWHY EVENT-LEVEL MEDIATION ANALYSIS SUMMARY")
+        print(f"{'=' * 150}")
 
-    for _, row in results_df.iterrows():
-        total_sig = "***" if row['total_pval'] < 0.001 else "**" if row['total_pval'] < 0.01 else "*" if row[
-                                                                                                             'total_pval'] < 0.05 else ""
-        direct_sig = "***" if row['direct_pval'] < 0.001 else "**" if row['direct_pval'] < 0.01 else "*" if row[
-                                                                                                                'direct_pval'] < 0.05 else ""
-        path_a_sig = "***" if row['path_a_pval'] < 0.001 else "**" if row['path_a_pval'] < 0.01 else "*" if row[
-                                                                                                                'path_a_pval'] < 0.05 else ""
-        path_b_sig = "***" if row['path_b_pval'] < 0.001 else "**" if row['path_b_pval'] < 0.01 else "*" if row[
-                                                                                                                'path_b_pval'] < 0.05 else ""
+        # Main results table
+        print("\n🎯 CAUSAL EFFECTS BY RADIUS (DOWHY EVENT-LEVEL AGGREGATED):")
+        print("─" * 150)
+        print(
+            f"{'Radius':>6} {'Events':>7} {'Avg Wells':>9} {'Total Effect':>13} {'95% CI':>20} {'Direct Effect':>14} {'95% CI':>20} {'Indirect':>11} {'% Med':>6} {'Causal R²':>9} {'Pred R²':>8}")
+        print("─" * 150)
 
-        print(f"{row['radius']:>4}km "
-              f"{row['total_pval']:>8.2e}{total_sig:<3} "
-              f"{row['direct_pval']:>8.2e}{direct_sig:<3} "
-              f"{row['path_a_pval']:>8.2e}{path_a_sig:<3} "
-              f"{row['path_b_pval']:>8.2e}{path_b_sig:<3} "
-              f"{row['bootstrap_success_rate']:>8.1%} "
-              f"{row['vif_b_avg']:>5.2f}")
+        for _, row in results_df.iterrows():
+            print(f"{row['radius']:>4}km {row['n_events']:>7,} "
+                  f"{row['avg_well_count']:>8.1f} "
+                  f"{row['total_effect']:>+10.3e} "
+                  f"[{row['total_ci_low']:>+7.2e},{row['total_ci_high']:>+7.2e}] "
+                  f"{row['direct_effect']:>+11.3e} "
+                  f"[{row['direct_ci_low']:>+7.2e},{row['direct_ci_high']:>+7.2e}] "
+                  f"{row['indirect_effect']:>+8.2e} "
+                  f"{row['prop_mediated']:>5.1f}% "
+                  f"{row['causal_r2']:>8.3f} "
+                  f"{row['predictive_r2']:>7.3f}")
 
-    print("─" * 120)
-    print("Significance: *** p<0.001, ** p<0.01, * p<0.05")
+        print("─" * 150)
 
-    # DoWhy refutation results
-    print("\n🔍 DOWHY REFUTATION TESTS:")
-    print("─" * 100)
-    print(f"{'Radius':>6} {'Original':>12} {'Placebo':>12} {'Subset':>12} {'Random Conf':>12} {'Status':>15}")
-    print("─" * 100)
+        # Statistical significance and quality metrics table
+        print("\n📈 STATISTICAL SIGNIFICANCE & QUALITY METRICS:")
+        print("─" * 120)
+        print(
+            f"{'Radius':>6} {'Total p-val':>12} {'Direct p-val':>13} {'Path a p-val':>13} {'Path b p-val':>13} {'Bootstrap':>10} {'VIF':>6}")
+        print("─" * 120)
 
-    for _, row in results_df.iterrows():
-        placebo_ratio = abs(row['placebo_effect'] / row['total_effect']) if row['total_effect'] != 0 else np.inf
-        subset_ratio = abs((row['subset_effect'] - row['total_effect']) / row['total_effect']) if row[
-                                                                                                      'total_effect'] != 0 else np.inf
+        for _, row in results_df.iterrows():
+            total_sig = "***" if row['total_pval'] < 0.001 else "**" if row['total_pval'] < 0.01 else "*" if row[
+                                                                                                                 'total_pval'] < 0.05 else ""
+            direct_sig = "***" if row['direct_pval'] < 0.001 else "**" if row['direct_pval'] < 0.01 else "*" if row[
+                                                                                                                    'direct_pval'] < 0.05 else ""
+            path_a_sig = "***" if row['path_a_pval'] < 0.001 else "**" if row['path_a_pval'] < 0.01 else "*" if row[
+                                                                                                                    'path_a_pval'] < 0.05 else ""
+            path_b_sig = "***" if row['path_b_pval'] < 0.001 else "**" if row['path_b_pval'] < 0.01 else "*" if row[
+                                                                                                                    'path_b_pval'] < 0.05 else ""
 
-        # Status assessment
-        status = "✅ PASS" if placebo_ratio < 0.1 and subset_ratio < 0.2 else "⚠️ CAUTION" if placebo_ratio < 0.3 else "❌ FAIL"
+            print(f"{row['radius']:>4}km "
+                  f"{row['total_pval']:>8.2e}{total_sig:<3} "
+                  f"{row['direct_pval']:>8.2e}{direct_sig:<3} "
+                  f"{row['path_a_pval']:>8.2e}{path_a_sig:<3} "
+                  f"{row['path_b_pval']:>8.2e}{path_b_sig:<3} "
+                  f"{row['bootstrap_success_rate']:>8.1%} "
+                  f"{row['vif_b_avg']:>5.2f}")
 
-        print(f"{row['radius']:>4}km "
-              f"{row['total_effect']:>+9.2e} "
-              f"{row['placebo_effect']:>+9.2e} "
-              f"{row['subset_effect']:>+9.2e} "
-              f"{row['random_confounder_effect']:>+9.2e} "
-              f"{status:>15}")
+        print("─" * 120)
+        print("Significance: *** p<0.001, ** p<0.01, * p<0.05")
 
-    print("─" * 100)
+        # DoWhy refutation results
+        print("\n🔍 DOWHY REFUTATION TESTS:")
+        print("─" * 100)
+        print(f"{'Radius':>6} {'Original':>12} {'Placebo':>12} {'Subset':>12} {'Random Conf':>12} {'Status':>15}")
+        print("─" * 100)
 
-    # Key insights
-    print("\n🔍 KEY INSIGHTS:")
-    print("─" * 70)
+        for _, row in results_df.iterrows():
+            placebo_ratio = abs(row['placebo_effect'] / row['total_effect']) if row['total_effect'] != 0 else np.inf
+            subset_ratio = abs((row['subset_effect'] - row['total_effect']) / row['total_effect']) if row[
+                                                                                                          'total_effect'] != 0 else np.inf
 
-    strongest_total = results_df.loc[results_df['total_effect'].abs().idxmax()]
-    highest_mediation = results_df.loc[results_df['prop_mediated'].idxmax()]
-    best_causal_r2 = results_df.loc[results_df['causal_r2'].idxmax()]
-    best_pred_r2 = results_df.loc[results_df['predictive_r2'].idxmax()]
+            # Status assessment
+            status = "✅ PASS" if placebo_ratio < 0.1 and subset_ratio < 0.2 else "⚠️ CAUTION" if placebo_ratio < 0.3 else "❌ FAIL"
 
-    print(f"• Strongest total effect:    {strongest_total['radius']}km ({strongest_total['total_effect']:+.3e})")
-    print(f"• Highest mediation:         {highest_mediation['radius']}km ({highest_mediation['prop_mediated']:.1f}%)")
-    print(f"• Best causal model fit:     {best_causal_r2['radius']}km (R²={best_causal_r2['causal_r2']:.3f})")
-    print(f"• Best predictive fit:       {best_pred_r2['radius']}km (R²={best_pred_r2['predictive_r2']:.3f})")
-    print(f"• Event sample size range:   {results_df['n_events'].min():,} - {results_df['n_events'].max():,} events")
-    print(
-        f"• Wells per event range:     {results_df['avg_well_count'].min():.1f} - {results_df['avg_well_count'].max():.1f}")
+            print(f"{row['radius']:>4}km "
+                  f"{row['total_effect']:>+9.2e} "
+                  f"{row['placebo_effect']:>+9.2e} "
+                  f"{row['subset_effect']:>+9.2e} "
+                  f"{row['random_confounder_effect']:>+9.2e} "
+                  f"{status:>15}")
 
-    # Mediation patterns
-    near_field = results_df[results_df['radius'] <= 5]
-    far_field = results_df[results_df['radius'] >= 10]
+        print("─" * 100)
 
-    if len(near_field) > 0 and len(far_field) > 0:
-        print(f"• Near-field mediation:      {near_field['prop_mediated'].mean():.1f}% (≤5km)")
-        print(f"• Far-field mediation:       {far_field['prop_mediated'].mean():.1f}% (≥10km)")
+        # Key insights
+        print("\n🔍 KEY INSIGHTS:")
+        print("─" * 70)
 
-    # Quality metrics
-    avg_bootstrap_success = results_df['bootstrap_success_rate'].mean()
-    avg_vif = results_df['vif_b_avg'].mean()
+        strongest_total = results_df.loc[results_df['total_effect'].abs().idxmax()]
+        highest_mediation = results_df.loc[results_df['prop_mediated'].idxmax()]
+        best_causal_r2 = results_df.loc[results_df['causal_r2'].idxmax()]
+        best_pred_r2 = results_df.loc[results_df['predictive_r2'].idxmax()]
 
-    print(f"• Average bootstrap success: {avg_bootstrap_success:.1%}")
-    print(f"• Average VIF:               {avg_vif:.2f}")
+        print(f"• Strongest total effect:    {strongest_total['radius']}km ({strongest_total['total_effect']:+.3e})")
+        print(f"• Highest mediation:         {highest_mediation['radius']}km ({highest_mediation['prop_mediated']:.1f}%)")
+        print(f"• Best causal model fit:     {best_causal_r2['radius']}km (R²={best_causal_r2['causal_r2']:.3f})")
+        print(f"• Best predictive fit:       {best_pred_r2['radius']}km (R²={best_pred_r2['predictive_r2']:.3f})")
+        print(f"• Event sample size range:   {results_df['n_events'].min():,} - {results_df['n_events'].max():,} events")
+        print(
+            f"• Wells per event range:     {results_df['avg_well_count'].min():.1f} - {results_df['avg_well_count'].max():.1f}")
 
-    # Refutation quality assessment
-    passed_refutations = sum([
-        abs(row['placebo_effect'] / row['total_effect']) < 0.1 and
-        abs((row['subset_effect'] - row['total_effect']) / row['total_effect']) < 0.2
-        for _, row in results_df.iterrows()
-        if row['total_effect'] != 0 and not np.isnan(row['placebo_effect'])
-    ])
+        # Mediation patterns
+        near_field = results_df[results_df['radius'] <= 5]
+        far_field = results_df[results_df['radius'] >= 10]
 
-    print(
-        f"• Refutation tests passed:   {passed_refutations}/{len(results_df)} ({passed_refutations / len(results_df):.1%})")
+        if len(near_field) > 0 and len(far_field) > 0:
+            print(f"• Near-field mediation:      {near_field['prop_mediated'].mean():.1f}% (≤5km)")
+            print(f"• Far-field mediation:       {far_field['prop_mediated'].mean():.1f}% (≥10km)")
 
-    print("─" * 70)
+        # Quality metrics
+        avg_bootstrap_success = results_df['bootstrap_success_rate'].mean()
+        avg_vif = results_df['vif_b_avg'].mean()
 
-    # Event-level vs Well-level comparison insights
-    print("\n📊 EVENT-LEVEL AGGREGATION BENEFITS:")
-    print("─" * 50)
-    print("• Reduced noise from duplicate earthquake magnitudes")
-    print("• Accounts for multiple wells affecting single events")
-    print("• Better signal-to-noise ratio for causal inference")
-    print("• Well count included as additional confounder")
-    print("• More interpretable units of analysis (events vs well-pairs)")
-    print("─" * 50)
+        print(f"• Average bootstrap success: {avg_bootstrap_success:.1%}")
+        print(f"• Average VIF:               {avg_vif:.2f}")
 
-    # Save results to CSV
-    output_file = f"dowhy_event_level_mediation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    results_df.to_csv(output_file, index=False)
-    print(f"\n💾 Results saved to: {output_file}")
+        # Refutation quality assessment
+        passed_refutations = sum([
+            abs(row['placebo_effect'] / row['total_effect']) < 0.1 and
+            abs((row['subset_effect'] - row['total_effect']) / row['total_effect']) < 0.2
+            for _, row in results_df.iterrows()
+            if row['total_effect'] != 0 and not np.isnan(row['placebo_effect'])
+        ])
 
-    # Save detailed summary with methodology notes
-    summary_file = f"dowhy_event_methodology_notes_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-    with open(summary_file, 'w') as f:
-        f.write("DoWhy Event-Level Mediation Analysis - Methodology Notes\n")
-        f.write("=" * 60 + "\n\n")
-        f.write("DATA AGGREGATION:\n")
-        f.write("- Raw data aggregated by EventID (earthquake events)\n")
-        f.write("- Injection volumes: summed across wells per event\n")
-        f.write("- Injection pressure: median across wells per event\n")
-        f.write("- Fault distance: minimum across wells per event\n")
-        f.write("- Fault segments: summed across wells per event\n")
-        f.write("- Well count: number of wells per event (added as confounder)\n\n")
+        print(
+            f"• Refutation tests passed:   {passed_refutations}/{len(results_df)} ({passed_refutations / len(results_df):.1%})")
 
-        f.write("CAUSAL MODEL:\n")
-        f.write("- Treatment (W): Total injection volume per event\n")
-        f.write("- Mediator (P): Median injection pressure per event\n")
-        f.write("- Outcome (S): Earthquake magnitude\n")
-        f.write("- Confounders: G1 (fault distance), G2 (fault segments), well_count\n\n")
+        print("─" * 70)
 
-        f.write("DOWHY FRAMEWORK:\n")
-        f.write("- Explicit causal DAG with backdoor adjustment\n")
-        f.write("- Bootstrap confidence intervals (50 iterations)\n")
-        f.write("- Refutation tests: placebo, subset, random confounder\n")
-        f.write("- Dual R² metrics: causal (linear) and predictive (log-transformed)\n\n")
+        # Event-level vs Well-level comparison insights
+        print("\n📊 EVENT-LEVEL AGGREGATION BENEFITS:")
+        print("─" * 50)
+        print("• Reduced noise from duplicate earthquake magnitudes")
+        print("• Accounts for multiple wells affecting single events")
+        print("• Better signal-to-noise ratio for causal inference")
+        print("• Well count included as additional confounder")
+        print("• More interpretable units of analysis (events vs well-pairs)")
+        print("─" * 50)
 
-        f.write("QUALITY METRICS:\n")
-        f.write(f"- Average bootstrap success rate: {avg_bootstrap_success:.1%}\n")
-        f.write(f"- Average VIF (multicollinearity): {avg_vif:.2f}\n")
-        f.write(
-            f"- Refutation tests passed: {passed_refutations}/{len(results_df)} ({passed_refutations / len(results_df):.1%})\n")
+        # Save results to CSV
+        output_file = f"dowhy_event_level_mediation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        results_df.to_csv(output_file, index=False)
+        print(f"\n💾 Results saved to: {output_file}")
 
-    print(f"📝 Methodology notes saved to: {summary_file}")
+        # Save detailed summary with methodology notes
+        summary_file = f"dowhy_event_methodology_notes_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        with open(summary_file, 'w') as f:
+            f.write("DoWhy Event-Level Mediation Analysis - Methodology Notes\n")
+            f.write("=" * 60 + "\n\n")
+            f.write("DATA AGGREGATION:\n")
+            f.write("- Raw data aggregated by EventID (earthquake events)\n")
+            f.write("- Injection volumes: summed across wells per event\n")
+            f.write("- Injection pressure: median across wells per event\n")
+            f.write("- Fault distance: minimum across wells per event\n")
+            f.write("- Fault segments: summed across wells per event\n")
+            f.write("- Well count: number of wells per event (added as confounder)\n\n")
 
-else:
-    print("\n❌ No valid results obtained from any files.")
+            f.write("CAUSAL MODEL:\n")
+            f.write("- Treatment (W): Total injection volume per event\n")
+            f.write("- Mediator (P): Median injection pressure per event\n")
+            f.write("- Outcome (S): Earthquake magnitude\n")
+            f.write("- Confounders: G1 (fault distance), G2 (fault segments), well_count\n\n")
 
-print(f"\n{'=' * 80}")
-print(f"DoWhy Event-Level Analysis completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-print(f"{'=' * 80}")
+            f.write("DOWHY FRAMEWORK:\n")
+            f.write("- Explicit causal DAG with backdoor adjustment\n")
+            f.write("- Bootstrap confidence intervals (50 iterations)\n")
+            f.write("- Refutation tests: placebo, subset, random confounder\n")
+            f.write("- Dual R² metrics: causal (linear) and predictive (log-transformed)\n\n")
+
+            f.write("QUALITY METRICS:\n")
+            f.write(f"- Average bootstrap success rate: {avg_bootstrap_success:.1%}\n")
+            f.write(f"- Average VIF (multicollinearity): {avg_vif:.2f}\n")
+            f.write(
+                f"- Refutation tests passed: {passed_refutations}/{len(results_df)} ({passed_refutations / len(results_df):.1%})\n")
+
+        print(f"📝 Methodology notes saved to: {summary_file}")
+
+    else:
+        print("\n❌ No valid results obtained from any files.")
+
+    print(f"\n{'=' * 80}")
+    print(f"DoWhy Event-Level Analysis completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'=' * 80}")
+
+
+if __name__ == "__main__":
+    _run_main()

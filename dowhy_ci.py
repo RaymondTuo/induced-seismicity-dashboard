@@ -1088,245 +1088,285 @@ def process_file(csv_file):
         return []  # CHANGE 1: return empty list instead of None
 
 
-# --- CHANGE 5: filter event files by lookback tag if --lookback-days was given ---
-csv_files = find_csv_files()
-if LOOKBACK_TAG is not None:
-    tagged = [f for f in csv_files if 'event_well_links_with_faults' in f and LOOKBACK_TAG in f]
-    if tagged:
-        event_files = tagged
-    else:
-        # 30d is the original pipeline default — untagged files are the 30d dataset
-        untagged = [f for f in csv_files if 'event_well_links_with_faults' in f
-                    and not re.search(r'_\d+d_', f)]
-        if untagged and LOOKBACK_DAYS_ARG == 30:
-            print(f"ℹ️  No files tagged '{LOOKBACK_TAG}' found — using untagged files (original 30d dataset).")
-            event_files = untagged
+
+
+def _run_main():
+    """Entry point; wrapped so ProcessPoolExecutor workers do not re-execute it."""
+    # --- CHANGE 5: filter event files by lookback tag if --lookback-days was given ---
+    csv_files = find_csv_files()
+    if LOOKBACK_TAG is not None:
+        tagged = [f for f in csv_files if 'event_well_links_with_faults' in f and LOOKBACK_TAG in f]
+        if tagged:
+            event_files = tagged
         else:
-            event_files = []
-else:
-    # Legacy behaviour: prefer un-tagged originals (historical filenames).
-    event_files = [f for f in csv_files if 'event_well_links_with_faults' in f
-                   and not re.search(r'_\d+d_', f)]
-    if not event_files:
-        # Current pipeline writes lookback-tagged files such as ..._30d_12km.csv
-        event_files = [f for f in csv_files if 'event_well_links_with_faults' in f
-                       and re.search(r'_\d+d_', f)]
-# --- END CHANGE 5 ---
-
-if not event_files:
-    print("❌ No event files found!")
-    exit(1)
-
-event_files.sort(key=lambda x: extract_radius(x))
-
-print(f"\n🎯 Found {len(event_files)} event files to process:")
-for i, file in enumerate(event_files):
-    radius = extract_radius(file)
-    size = os.path.getsize(file) / (1024 * 1024)
-    print(f"  {i + 1:2d}. {radius:2d}km - {file} ({size:.1f} MB)")
-
-# CHANGE 1: report which models will be run before the main loop starts
-print(f"\n🧪 Models to compare: {list(MODEL_CONFIGS.keys())}")
-
-print(f"\n{'=' * 80}")
-print("BATCH DOWHY MEDIATION ANALYSIS WITH BOOTSTRAP CI")
-print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-print(f"{'=' * 80}")
-
-# CHANGE 1: process_file() now returns a list (one dict per model per file).
-# Use extend() instead of append() so all model results land in a flat list.
-results = []
-for i, csv_file in enumerate(event_files):
-    print(f"\n[{i + 1}/{len(event_files)}] Processing {csv_file}...")
-
-    # --- CHANGE 1: was result = process_file(csv_file) / results.append(result) ---
-    # result = process_file(csv_file)
-    # if result:
-    #     results.append(result)
-    file_results = process_file(csv_file)
-    results.extend(file_results)
-    # --- END CHANGE 1 (main loop accumulation) ---
-
-
-# =============================================================================
-# Output tables
-# =============================================================================
-
-if results:
-    # CHANGE 1: sort by model_name first, then radius, so per-model tables are contiguous
-    results_df = pd.DataFrame(results).sort_values(['model_name', 'radius'])
-
-    print(f"\n{'=' * 140}")
-    print("📊 COMPREHENSIVE DOWHY MEDIATION ANALYSIS SUMMARY")
-    print(f"{'=' * 140}")
-
-    # CHANGE 1: one causal-effects table and one significance table per model
-    for model_name in MODEL_CONFIGS.keys():
-        model_df = results_df[results_df['model_name'] == model_name]
-        if model_df.empty:
-            continue
-
-        print(f"\n{'─' * 6} MODEL: {model_name.upper()} {'─' * 6}")
-
-        print("\n🎯 CAUSAL EFFECTS BY RADIUS:")
-        print("─" * 150)
-        print(
-            f"{'Radius':>6} {'N':>7} {'Total Effect':>13} {'95% CI':>20} "
-            f"{'Direct Effect':>14} {'95% CI':>20} {'Indirect':>11} "
-            f"{'% Med':>6} {'Causal R²':>9} {'Pred R²':>8} {'MAE':>8} {'SS':>8} {'ρ':>8}"
-        )
-        print("─" * 150)
-
-        for _, row in model_df.iterrows():
-            causal_r2_str = f"{row['causal_r2']:8.3f}" if pd.notna(row['causal_r2']) else "     n/a"
-            pred_r2_str = f"{row['predictive_r2']:7.3f}" if pd.notna(row['predictive_r2']) else "   n/a"
-            mae_str = f"{row['mae']:7.3f}" if pd.notna(row['mae']) else "   n/a"
-            ss_str = f"{row['skill_score']:7.3f}" if pd.notna(row['skill_score']) else "   n/a"
-            rho_str = f"{row['spearman_rho']:7.3f}" if pd.notna(row['spearman_rho']) else "   n/a"
-            print(
-                f"{row['radius']:>4}km {row['n_rows']:>7,} "
-                f"{row['total_effect']:>+10.3e} "
-                f"[{row['total_ci_low']:>+7.2e},{row['total_ci_high']:>+7.2e}] "
-                f"{row['direct_effect']:>+11.3e} "
-                f"[{row['direct_ci_low']:>+7.2e},{row['direct_ci_high']:>+7.2e}] "
-                f"{row['indirect_effect']:>+8.2e} "
-                f"{row['prop_mediated']:>5.1f}% "
-                f"{causal_r2_str} "
-                f"{pred_r2_str} "
-                f"{mae_str} "
-                f"{ss_str} "
-                f"{rho_str}"
-            )
-
-        print("─" * 150)
-
-        print(f"\n📈 STATISTICAL SIGNIFICANCE & QUALITY [{model_name}]:")
-        print("─" * 120)
-        print(
-            f"{'Radius':>6} {'Total p-val':>12} {'Direct p-val':>13} "
-            f"{'Path a p-val':>13} {'Path b p-val':>13} {'Bootstrap':>10} {'VIF':>6}"
-        )
-        print("─" * 120)
-
-        for _, row in model_df.iterrows():
-            print(
-                f"{row['radius']:>4}km "
-                f"{_fmt_pval(row['total_pval'])} "
-                f"{_fmt_pval(row['direct_pval'])} "
-                f"{_fmt_pval(row['path_a_pval'])} "
-                f"{_fmt_pval(row['path_b_pval'])} "
-                f"{row['bootstrap_success_rate']:>8.1%} "
-                f"{row['vif_b_avg']:>5.2f}"
-            )
-
-        print("─" * 120)
-        print("Significance: *** p<0.001, ** p<0.01, * p<0.05  |  n/a = not applicable for this estimator")
-
-    # CHANGE 1: Refutation table per model
-    for model_name in MODEL_CONFIGS.keys():
-        model_df = results_df[results_df['model_name'] == model_name]
-        if model_df.empty:
-            continue
-
-        print(f"\n🔍 DOWHY REFUTATION TESTS [{model_name}]:")
-        print("─" * 80)
-        print(f"{'Radius':>6} {'Original':>12} {'Placebo':>12} {'Subset':>12} {'Status':>15}")
-        print("─" * 80)
-
-        for _, row in model_df.iterrows():
-            placebo_ratio = (
-                abs(row['placebo_effect'] / row['total_effect'])
-                if row['total_effect'] != 0 else np.inf
-            )
-            subset_ratio = (
-                abs((row['subset_effect'] - row['total_effect']) / row['total_effect'])
-                if row['total_effect'] != 0 else np.inf
-            )
-            status = (
-                "✅ PASS" if placebo_ratio < 0.1 and subset_ratio < 0.2
-                else "⚠️ CAUTION" if placebo_ratio < 0.3
-                else "❌ FAIL"
-            )
-            print(
-                f"{row['radius']:>4}km "
-                f"{row['total_effect']:>+9.2e} "
-                f"{row['placebo_effect']:>+9.2e} "
-                f"{row['subset_effect']:>+9.2e} "
-                f"{status:>15}"
-            )
-
-        print("─" * 80)
-
-    # CHANGE 1: Cross-model comparison table — total effect and predictive R² side by side
-    # This is the primary output for deciding which estimator to adopt.
-    print(f"\n🔬 CROSS-MODEL COMPARISON  (Total Effect | Predictive R²  by radius):")
-    print("─" * 130)
-    model_names = list(MODEL_CONFIGS.keys())
-    header = f"{'Radius':>6}"
-    for mn in model_names:
-        short_name = mn[:12]
-        header += f"  {short_name:>12} {'R²':>6} {'MAE':>6} {'SS':>6} {'ρ':>6}"
-    print(header)
-    print("─" * 130)
-
-    for radius in sorted(results_df['radius'].unique()):
-        line = f"{radius:>4}km"
-        for mn in model_names:
-            mask = (results_df['model_name'] == mn) & (results_df['radius'] == radius)
-            if mask.any():
-                row = results_df[mask].iloc[0]
-                r2_str = f"{row['predictive_r2']:.3f}" if pd.notna(row['predictive_r2']) else "n/a"
-                mae_str = f"{row['mae']:.3f}" if pd.notna(row['mae']) else "n/a"
-                ss_str = f"{row['skill_score']:.3f}" if pd.notna(row['skill_score']) else "n/a"
-                rho_str = f"{row['spearman_rho']:.3f}" if pd.notna(row['spearman_rho']) else "n/a"
-                line += f"  {row['total_effect']:>+12.3e} {r2_str:>6} {mae_str:>6} {ss_str:>6} {rho_str:>6}"
+            # 30d is the original pipeline default — untagged files are the 30d dataset
+            untagged = [f for f in csv_files if 'event_well_links_with_faults' in f
+                        and not re.search(r'_\d+d_', f)]
+            if untagged and LOOKBACK_DAYS_ARG == 30:
+                print(f"ℹ️  No files tagged '{LOOKBACK_TAG}' found — using untagged files (original 30d dataset).")
+                event_files = untagged
             else:
-                line += f"  {'n/a':>12} {'n/a':>6} {'n/a':>6} {'n/a':>6} {'n/a':>6}"
-        print(line)
+                event_files = []
+    else:
+        # Legacy behaviour: prefer un-tagged originals (historical filenames).
+        event_files = [f for f in csv_files if 'event_well_links_with_faults' in f
+                       and not re.search(r'_\d+d_', f)]
+        if not event_files:
+            # Current pipeline writes lookback-tagged files such as ..._30d_12km.csv
+            event_files = [f for f in csv_files if 'event_well_links_with_faults' in f
+                           and re.search(r'_\d+d_', f)]
+    # --- END CHANGE 5 ---
 
-    print("─" * 130)
+    if not event_files:
+        print("❌ No event files found!")
+        exit(1)
 
-    # Key insights using OLS baseline for backward-compatible headline numbers
-    ols_df = results_df[results_df['model_name'] == 'ols_baseline']
-    if not ols_df.empty:
-        print("\n🔍 KEY INSIGHTS (OLS BASELINE):")
-        print("─" * 60)
-        strongest_total = ols_df.loc[ols_df['total_effect'].abs().idxmax()]
-        highest_mediation = ols_df.loc[ols_df['prop_mediated'].idxmax()]
-        best_pred_r2 = ols_df.loc[ols_df['predictive_r2'].idxmax()]
-        best_mae = ols_df.loc[ols_df['mae'].idxmin()]
-        best_ss = ols_df.loc[ols_df['skill_score'].idxmax()]
-        best_rho = ols_df.loc[ols_df['spearman_rho'].idxmax()]
+    event_files.sort(key=lambda x: extract_radius(x))
 
-        print(f"• Strongest total effect:    {strongest_total['radius']}km ({strongest_total['total_effect']:+.3e})")
-        print(f"• Highest mediation:         {highest_mediation['radius']}km ({highest_mediation['prop_mediated']:.1f}%)")
-        print(f"• Best predictive fit:       {best_pred_r2['radius']}km (R²={best_pred_r2['predictive_r2']:.3f})")
-        print(f"• Best predictive fit (R²):  {best_pred_r2['radius']}km (R²={best_pred_r2['predictive_r2']:.3f})")
-        print(f"• Lowest MAE:                {best_mae['radius']}km (MAE={best_mae['mae']:.3f})")
-        print(f"• Best Skill Score:          {best_ss['radius']}km (SS={best_ss['skill_score']:.3f})")
-        print(f"• Best Spearman rho:         {best_rho['radius']}km (ρ={best_rho['spearman_rho']:.3f})")
-        print(f"• Sample size range:         {ols_df['n_rows'].min():,} - {ols_df['n_rows'].max():,}")
+    print(f"\n🎯 Found {len(event_files)} event files to process:")
+    for i, file in enumerate(event_files):
+        radius = extract_radius(file)
+        size = os.path.getsize(file) / (1024 * 1024)
+        print(f"  {i + 1:2d}. {radius:2d}km - {file} ({size:.1f} MB)")
 
-        near_field = ols_df[ols_df['radius'] <= 5]
-        far_field = ols_df[ols_df['radius'] >= 10]
-        print(f"• Near-field mediation:      {near_field['prop_mediated'].mean():.1f}% (≤5km)")
-        print(f"• Far-field mediation:       {far_field['prop_mediated'].mean():.1f}% (≥10km)")
-        print(f"• Average bootstrap success: {ols_df['bootstrap_success_rate'].mean():.1%}")
-        print(f"• Average VIF:               {ols_df['vif_b_avg'].mean():.2f}")
-        print("─" * 60)
+    # CHANGE 1: report which models will be run before the main loop starts
+    print(f"\n🧪 Models to compare: {list(MODEL_CONFIGS.keys())}")
 
-    # Save full multi-model results to CSV
-    _tag_part = f"_{LOOKBACK_TAG}" if LOOKBACK_TAG else ""
-    _log_part = "" if APPLY_LOG_TRANSFORM else "_nolog"
-    output_file = f"dowhy_mediation_analysis{_tag_part}{_log_part}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    results_df.to_csv(output_file, index=False)
-    print(f"\n💾 Results saved to: {output_file}")
-    print(f"   Rows: {len(results_df)}  ({len(event_files)} radii × {len(MODEL_CONFIGS)} models)")
-    print(f"   Columns: {list(results_df.columns)}")
+    print(f"\n{'=' * 80}")
+    print("BATCH DOWHY MEDIATION ANALYSIS WITH BOOTSTRAP CI")
+    print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'=' * 80}")
 
-else:
-    print("\n❌ No valid results obtained from any files.")
+    # CHANGE 1: process_file() now returns a list (one dict per model per file).
+    # Use extend() instead of append() so all model results land in a flat list.
 
-print(f"\n{'=' * 80}")
-print(f"Analysis completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-print(f"{'=' * 80}")
+    # --- PARALLEL MIGRATION: applied by migrate_to_parallel.py ---
+    # Distribute radii across worker processes. Each process_file() call is
+    # fully independent (loads its own CSV, uses iteration-indexed bootstrap
+    # seeds), so output is bit-identical to serial execution.
+    import os as _os
+    try:
+        from joblib import Parallel, delayed  # type: ignore
+        _have_joblib = True
+    except ImportError:  # pragma: no cover - fallback if joblib missing
+        _have_joblib = False
+
+    _n_jobs_env = _os.environ.get("DOWHY_CI_JOBS", "").strip()
+    try:
+        _n_jobs = int(_n_jobs_env) if _n_jobs_env else 0
+    except ValueError:
+        _n_jobs = 0
+    if _n_jobs <= 0:
+        _cpu = _os.cpu_count() or 1
+        _n_jobs = min(8, len(event_files), max(1, _cpu - 1))
+
+    print(f"\n🔀  Parallel execution: {_n_jobs} worker(s) across {len(event_files)} radii "
+          f"(override with DOWHY_CI_JOBS)")
+
+    results = []
+    if _have_joblib and _n_jobs > 1:
+        _all = Parallel(n_jobs=_n_jobs, backend="loky", verbose=5)(
+            delayed(process_file)(csv_file) for csv_file in event_files
+        )
+        for file_results in _all:
+            if file_results:
+                # dowhy_ci returns list; dowhy_ci_aggregated returns dict or None.
+                if isinstance(file_results, list):
+                    results.extend(file_results)
+                else:
+                    results.append(file_results)
+    else:
+        for i, csv_file in enumerate(event_files):
+            print(f"\n[{i + 1}/{len(event_files)}] Processing {csv_file}...")
+            file_results = process_file(csv_file)
+            if file_results:
+                if isinstance(file_results, list):
+                    results.extend(file_results)
+                else:
+                    results.append(file_results)
+    # =============================================================================
+    # Output tables
+    # =============================================================================
+
+    if results:
+        # CHANGE 1: sort by model_name first, then radius, so per-model tables are contiguous
+        results_df = pd.DataFrame(results).sort_values(['model_name', 'radius'])
+
+        print(f"\n{'=' * 140}")
+        print("📊 COMPREHENSIVE DOWHY MEDIATION ANALYSIS SUMMARY")
+        print(f"{'=' * 140}")
+
+        # CHANGE 1: one causal-effects table and one significance table per model
+        for model_name in MODEL_CONFIGS.keys():
+            model_df = results_df[results_df['model_name'] == model_name]
+            if model_df.empty:
+                continue
+
+            print(f"\n{'─' * 6} MODEL: {model_name.upper()} {'─' * 6}")
+
+            print("\n🎯 CAUSAL EFFECTS BY RADIUS:")
+            print("─" * 150)
+            print(
+                f"{'Radius':>6} {'N':>7} {'Total Effect':>13} {'95% CI':>20} "
+                f"{'Direct Effect':>14} {'95% CI':>20} {'Indirect':>11} "
+                f"{'% Med':>6} {'Causal R²':>9} {'Pred R²':>8} {'MAE':>8} {'SS':>8} {'ρ':>8}"
+            )
+            print("─" * 150)
+
+            for _, row in model_df.iterrows():
+                causal_r2_str = f"{row['causal_r2']:8.3f}" if pd.notna(row['causal_r2']) else "     n/a"
+                pred_r2_str = f"{row['predictive_r2']:7.3f}" if pd.notna(row['predictive_r2']) else "   n/a"
+                mae_str = f"{row['mae']:7.3f}" if pd.notna(row['mae']) else "   n/a"
+                ss_str = f"{row['skill_score']:7.3f}" if pd.notna(row['skill_score']) else "   n/a"
+                rho_str = f"{row['spearman_rho']:7.3f}" if pd.notna(row['spearman_rho']) else "   n/a"
+                print(
+                    f"{row['radius']:>4}km {row['n_rows']:>7,} "
+                    f"{row['total_effect']:>+10.3e} "
+                    f"[{row['total_ci_low']:>+7.2e},{row['total_ci_high']:>+7.2e}] "
+                    f"{row['direct_effect']:>+11.3e} "
+                    f"[{row['direct_ci_low']:>+7.2e},{row['direct_ci_high']:>+7.2e}] "
+                    f"{row['indirect_effect']:>+8.2e} "
+                    f"{row['prop_mediated']:>5.1f}% "
+                    f"{causal_r2_str} "
+                    f"{pred_r2_str} "
+                    f"{mae_str} "
+                    f"{ss_str} "
+                    f"{rho_str}"
+                )
+
+            print("─" * 150)
+
+            print(f"\n📈 STATISTICAL SIGNIFICANCE & QUALITY [{model_name}]:")
+            print("─" * 120)
+            print(
+                f"{'Radius':>6} {'Total p-val':>12} {'Direct p-val':>13} "
+                f"{'Path a p-val':>13} {'Path b p-val':>13} {'Bootstrap':>10} {'VIF':>6}"
+            )
+            print("─" * 120)
+
+            for _, row in model_df.iterrows():
+                print(
+                    f"{row['radius']:>4}km "
+                    f"{_fmt_pval(row['total_pval'])} "
+                    f"{_fmt_pval(row['direct_pval'])} "
+                    f"{_fmt_pval(row['path_a_pval'])} "
+                    f"{_fmt_pval(row['path_b_pval'])} "
+                    f"{row['bootstrap_success_rate']:>8.1%} "
+                    f"{row['vif_b_avg']:>5.2f}"
+                )
+
+            print("─" * 120)
+            print("Significance: *** p<0.001, ** p<0.01, * p<0.05  |  n/a = not applicable for this estimator")
+
+        # CHANGE 1: Refutation table per model
+        for model_name in MODEL_CONFIGS.keys():
+            model_df = results_df[results_df['model_name'] == model_name]
+            if model_df.empty:
+                continue
+
+            print(f"\n🔍 DOWHY REFUTATION TESTS [{model_name}]:")
+            print("─" * 80)
+            print(f"{'Radius':>6} {'Original':>12} {'Placebo':>12} {'Subset':>12} {'Status':>15}")
+            print("─" * 80)
+
+            for _, row in model_df.iterrows():
+                placebo_ratio = (
+                    abs(row['placebo_effect'] / row['total_effect'])
+                    if row['total_effect'] != 0 else np.inf
+                )
+                subset_ratio = (
+                    abs((row['subset_effect'] - row['total_effect']) / row['total_effect'])
+                    if row['total_effect'] != 0 else np.inf
+                )
+                status = (
+                    "✅ PASS" if placebo_ratio < 0.1 and subset_ratio < 0.2
+                    else "⚠️ CAUTION" if placebo_ratio < 0.3
+                    else "❌ FAIL"
+                )
+                print(
+                    f"{row['radius']:>4}km "
+                    f"{row['total_effect']:>+9.2e} "
+                    f"{row['placebo_effect']:>+9.2e} "
+                    f"{row['subset_effect']:>+9.2e} "
+                    f"{status:>15}"
+                )
+
+            print("─" * 80)
+
+        # CHANGE 1: Cross-model comparison table — total effect and predictive R² side by side
+        # This is the primary output for deciding which estimator to adopt.
+        print(f"\n🔬 CROSS-MODEL COMPARISON  (Total Effect | Predictive R²  by radius):")
+        print("─" * 130)
+        model_names = list(MODEL_CONFIGS.keys())
+        header = f"{'Radius':>6}"
+        for mn in model_names:
+            short_name = mn[:12]
+            header += f"  {short_name:>12} {'R²':>6} {'MAE':>6} {'SS':>6} {'ρ':>6}"
+        print(header)
+        print("─" * 130)
+
+        for radius in sorted(results_df['radius'].unique()):
+            line = f"{radius:>4}km"
+            for mn in model_names:
+                mask = (results_df['model_name'] == mn) & (results_df['radius'] == radius)
+                if mask.any():
+                    row = results_df[mask].iloc[0]
+                    r2_str = f"{row['predictive_r2']:.3f}" if pd.notna(row['predictive_r2']) else "n/a"
+                    mae_str = f"{row['mae']:.3f}" if pd.notna(row['mae']) else "n/a"
+                    ss_str = f"{row['skill_score']:.3f}" if pd.notna(row['skill_score']) else "n/a"
+                    rho_str = f"{row['spearman_rho']:.3f}" if pd.notna(row['spearman_rho']) else "n/a"
+                    line += f"  {row['total_effect']:>+12.3e} {r2_str:>6} {mae_str:>6} {ss_str:>6} {rho_str:>6}"
+                else:
+                    line += f"  {'n/a':>12} {'n/a':>6} {'n/a':>6} {'n/a':>6} {'n/a':>6}"
+            print(line)
+
+        print("─" * 130)
+
+        # Key insights using OLS baseline for backward-compatible headline numbers
+        ols_df = results_df[results_df['model_name'] == 'ols_baseline']
+        if not ols_df.empty:
+            print("\n🔍 KEY INSIGHTS (OLS BASELINE):")
+            print("─" * 60)
+            strongest_total = ols_df.loc[ols_df['total_effect'].abs().idxmax()]
+            highest_mediation = ols_df.loc[ols_df['prop_mediated'].idxmax()]
+            best_pred_r2 = ols_df.loc[ols_df['predictive_r2'].idxmax()]
+            best_mae = ols_df.loc[ols_df['mae'].idxmin()]
+            best_ss = ols_df.loc[ols_df['skill_score'].idxmax()]
+            best_rho = ols_df.loc[ols_df['spearman_rho'].idxmax()]
+
+            print(f"• Strongest total effect:    {strongest_total['radius']}km ({strongest_total['total_effect']:+.3e})")
+            print(f"• Highest mediation:         {highest_mediation['radius']}km ({highest_mediation['prop_mediated']:.1f}%)")
+            print(f"• Best predictive fit:       {best_pred_r2['radius']}km (R²={best_pred_r2['predictive_r2']:.3f})")
+            print(f"• Best predictive fit (R²):  {best_pred_r2['radius']}km (R²={best_pred_r2['predictive_r2']:.3f})")
+            print(f"• Lowest MAE:                {best_mae['radius']}km (MAE={best_mae['mae']:.3f})")
+            print(f"• Best Skill Score:          {best_ss['radius']}km (SS={best_ss['skill_score']:.3f})")
+            print(f"• Best Spearman rho:         {best_rho['radius']}km (ρ={best_rho['spearman_rho']:.3f})")
+            print(f"• Sample size range:         {ols_df['n_rows'].min():,} - {ols_df['n_rows'].max():,}")
+
+            near_field = ols_df[ols_df['radius'] <= 5]
+            far_field = ols_df[ols_df['radius'] >= 10]
+            print(f"• Near-field mediation:      {near_field['prop_mediated'].mean():.1f}% (≤5km)")
+            print(f"• Far-field mediation:       {far_field['prop_mediated'].mean():.1f}% (≥10km)")
+            print(f"• Average bootstrap success: {ols_df['bootstrap_success_rate'].mean():.1%}")
+            print(f"• Average VIF:               {ols_df['vif_b_avg'].mean():.2f}")
+            print("─" * 60)
+
+        # Save full multi-model results to CSV
+        _tag_part = f"_{LOOKBACK_TAG}" if LOOKBACK_TAG else ""
+        _log_part = "" if APPLY_LOG_TRANSFORM else "_nolog"
+        output_file = f"dowhy_mediation_analysis{_tag_part}{_log_part}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        results_df.to_csv(output_file, index=False)
+        print(f"\n💾 Results saved to: {output_file}")
+        print(f"   Rows: {len(results_df)}  ({len(event_files)} radii × {len(MODEL_CONFIGS)} models)")
+        print(f"   Columns: {list(results_df.columns)}")
+
+    else:
+        print("\n❌ No valid results obtained from any files.")
+
+    print(f"\n{'=' * 80}")
+    print(f"Analysis completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'=' * 80}")
+
+
+if __name__ == "__main__":
+    _run_main()

@@ -49,28 +49,13 @@ from sklearn.metrics import mean_squared_error, r2_score
 warnings.filterwarnings("ignore", category=FutureWarning)
 logging.getLogger("dowhy").setLevel(logging.ERROR)
 
-# List of input CSV files (one per radius)
+# List of input CSV files (one per radius).
+# Upstream pipeline switched from a 30-day to a 90-day injection lookback; keep
+# this list aligned with `event_well_links_with_faults_90d_*km.csv` on disk.
+LOOKBACK_TAG = "90d"
 CSV_FILES = [
-    "event_well_links_with_faults_30d_1km.csv",
-    "event_well_links_with_faults_30d_2km.csv",
-    "event_well_links_with_faults_30d_3km.csv",
-    "event_well_links_with_faults_30d_4km.csv",
-    "event_well_links_with_faults_30d_5km.csv",
-    "event_well_links_with_faults_30d_6km.csv",
-    "event_well_links_with_faults_30d_7km.csv",
-    "event_well_links_with_faults_30d_8km.csv",
-    "event_well_links_with_faults_30d_9km.csv",
-    "event_well_links_with_faults_30d_10km.csv",
-    "event_well_links_with_faults_30d_11km.csv",
-    "event_well_links_with_faults_30d_12km.csv",
-    "event_well_links_with_faults_30d_13km.csv",
-    "event_well_links_with_faults_30d_14km.csv",
-    "event_well_links_with_faults_30d_15km.csv",
-    "event_well_links_with_faults_30d_16km.csv",
-    "event_well_links_with_faults_30d_17km.csv",
-    "event_well_links_with_faults_30d_18km.csv",
-    "event_well_links_with_faults_30d_19km.csv",
-    "event_well_links_with_faults_30d_20km.csv"
+    f"event_well_links_with_faults_{LOOKBACK_TAG}_{r}km.csv"
+    for r in range(1, 21)
 ]
 
 # Output summary file

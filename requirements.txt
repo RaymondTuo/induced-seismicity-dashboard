@@ -9,6 +9,8 @@ econml>=0.15
 statsmodels
 dowhy
 networkx==2.8.8
+# pydot 4.x breaks nx.nx_pydot.from_pydot with networkx 2.8 (get_strict); dowhy 0.12 also expects nx 2.x (d_separated API)
+pydot>=1.4.2,<3
 plotly
 streamlit
 matplotlib
@@ -16,3 +18,4 @@ tqdm
 geopandas
 pydot
 seaborn
+joblib>=1.3
