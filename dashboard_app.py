@@ -39,9 +39,17 @@ _TEMPLATE.layout.update(
     title=dict(font=dict(family=THEME_FONT, size=16, color="#102a43")),
     paper_bgcolor="#ffffff",
     plot_bgcolor="#ffffff",
+    # Okabe-Ito palette — colorblind-safe under deuteranopia, protanopia, tritanopia.
+    # Order is intentionally chosen for maximum pairwise contrast on white.
     colorway=[
-        "#0d47a1", "#e65100", "#2e7d32", "#6a1b9a",
-        "#00838f", "#b71c1c", "#455a64", "#5d4037",
+        "#0072B2",  # blue
+        "#D55E00",  # vermillion
+        "#009E73",  # bluish green
+        "#CC79A7",  # reddish purple
+        "#E69F00",  # orange
+        "#56B4E9",  # sky blue
+        "#000000",  # black
+        "#999999",  # neutral grey (reserved for references)
     ],
     margin=dict(l=60, r=20, t=48, b=48),
     hoverlabel=dict(
@@ -81,20 +89,25 @@ def style_fig(fig: go.Figure, *, height: int | None = None, tight: bool = False)
     return fig
 
 
-# Distinct, colorblind-friendly model colors (extend if new model_type values appear)
+# Distinct, colorblind-safe model colors (Okabe-Ito palette).
+# Extend here if new model_type values appear.
 _MODEL_COLOR_MAP = {
-    "OLS": "#0d47a1",
-    "NonParamDML": "#e65100",
-    "DML-GBM": "#2e7d32",
-    "DML-RF": "#6a1b9a",
-    "DML-Lasso": "#00838f",
-    "OLS (baseline)": "#0d47a1",
+    "OLS": "#0072B2",                # blue
+    "OLS (baseline)": "#0072B2",     # blue
+    "ols_baseline": "#0072B2",
+    "NonParamDML": "#E69F00",        # orange
+    "DML-GBM": "#009E73",             # bluish green
+    "gbm_nonparam": "#009E73",
+    "DML-RF": "#CC79A7",              # reddish purple
+    "rf_nonparam": "#CC79A7",
+    "DML-Lasso": "#56B4E9",           # sky blue
+    "lasso_nonparam": "#56B4E9",
 }
 
-# Semantic colors used in the Hurdle & Causal tabs.
-COLOR_PROB = "#1e88e5"        # earthquake probability / occurrence
-COLOR_MAG = "#c62828"         # earthquake magnitude / severity
-COLOR_NEUTRAL = "#455a64"     # baseline / neutral reference
+# Semantic colors used in the Hurdle & Causal tabs (Okabe-Ito).
+COLOR_PROB = "#0072B2"        # earthquake probability / occurrence — blue
+COLOR_MAG = "#D55E00"         # earthquake magnitude / severity — vermillion
+COLOR_NEUTRAL = "#666666"     # baseline / neutral reference — medium grey
 
 _METRIC_LABELS = {
     "r2": "R² (predictive)",
@@ -110,17 +123,23 @@ _EFFECT_LABELS = {
 }
 
 _EFFECT_COLOR_MAP = {
-    "Direct effect (W → S)": "#0d47a1",
-    "Indirect (W → P → S)": "#e65100",
-    "Total effect": "#2e7d32",
+    "Direct effect (W → S)": "#0072B2",    # blue
+    "Indirect (W → P → S)": "#E69F00",     # orange
+    "Total effect": "#009E73",              # bluish green
 }
+
+# Colorblind-safe fallback palette for any unmapped categories.
+# Okabe-Ito minus near-white yellow (#F0E442) which has poor contrast on white bg.
+_CB_SAFE_FALLBACK = [
+    "#0072B2", "#D55E00", "#009E73", "#CC79A7",
+    "#E69F00", "#56B4E9", "#000000", "#999999",
+]
 
 
 def _model_color_map(model_types: list[str]) -> dict[str, str]:
     out = {}
-    palette = px.colors.qualitative.Dark2 + px.colors.qualitative.Set2
     for i, m in enumerate(sorted(set(model_types))):
-        out[m] = _MODEL_COLOR_MAP.get(m, palette[i % len(palette)])
+        out[m] = _MODEL_COLOR_MAP.get(m, _CB_SAFE_FALLBACK[i % len(_CB_SAFE_FALLBACK)])
     return out
 
 
@@ -150,12 +169,39 @@ def _flatten_plotly_customdata(raw) -> list:
     return [raw]
 
 
+def _norm_id(x) -> str | None:
+    """Canonical string form for EventID / api_number.
+
+    Handles the common case where a numeric ID (e.g. `42329012345678`) is loaded
+    as a float by pandas and stringifies to `'42329012345678.0'` on one side of a
+    comparison while the other side renders it as `'42329012345678'`. Without
+    this normalization, map click handlers fail to match the selected point back
+    to rows in `links_df`, so no linked events/wells are shown.
+    """
+    if x is None:
+        return None
+    try:
+        if pd.isna(x):
+            return None
+    except (TypeError, ValueError):
+        pass
+    s = str(x).strip()
+    if s == "" or s.lower() in {"nan", "none", "<na>"}:
+        return None
+    # Strip trailing '.0' for integer-valued floats (works for negative ints too).
+    if s.endswith(".0"):
+        body = s[:-2]
+        if body.lstrip("-").isdigit():
+            s = body
+    return s
+
+
 def _parse_map_selection_point(point: dict) -> tuple[str | None, str | None, str | None]:
     """From a Plotly selection point dict, return (point_type, EventID, api_number)."""
     cd = point.get("customdata")
     flat = _flatten_plotly_customdata(cd)
     if len(flat) >= 3:
-        return str(flat[0]), str(flat[1]), str(flat[2])
+        return _norm_id(flat[0]), _norm_id(flat[1]), _norm_id(flat[2])
     return None, None, None
 
 
@@ -393,10 +439,13 @@ def _build_map_points(links: pd.DataFrame) -> pd.DataFrame:
 
     pts = pd.concat([event_pts, well_pts], ignore_index=True)
     pts = pts.dropna(subset=["lat", "lon"])
+    # Normalize IDs so plotly customdata round-trips back to matching strings.
+    pts["EventID"] = pts["EventID"].map(_norm_id)
+    pts["api_number"] = pts["api_number"].map(_norm_id)
     pts["label"] = np.where(
         pts["point_type"].eq("Event"),
-        "Event " + pts["EventID"].astype(str),
-        "Well " + pts["api_number"].astype(str),
+        "Event " + pts["EventID"].fillna("").astype(str),
+        "Well " + pts["api_number"].fillna("").astype(str),
     )
     return pts
 
@@ -1219,66 +1268,79 @@ def main() -> None:
             if links_df.empty:
                 st.warning("No event-well links match the selected magnitude range.")
             else:
+                # Normalize IDs on the source frame so click-handler comparisons are consistent.
+                links_df = links_df.copy()
+                if "EventID" in links_df.columns:
+                    links_df["EventID"] = links_df["EventID"].map(_norm_id)
+                if "api_number" in links_df.columns:
+                    links_df["api_number"] = links_df["api_number"].map(_norm_id)
                 points_df = _build_map_points(links_df)
-                if "map_selected_event" not in st.session_state:
-                    st.session_state["map_selected_event"] = None
-                if "map_selected_well" not in st.session_state:
-                    st.session_state["map_selected_well"] = None
 
                 event_options = sorted(points_df["EventID"].dropna().astype(str).unique().tolist())
                 well_options = sorted(points_df["api_number"].dropna().astype(str).unique().tolist())
+
+                # --- State sync: apply any pending map-click selection to the
+                # selectbox widget state BEFORE the widgets are instantiated.
+                # Streamlit disallows writing to a widget key after the widget
+                # has rendered, so the click handler below can only stash the
+                # desired value under `_pending_pick_*`; we transfer it here.
+                pending_ev = st.session_state.pop("_pending_pick_event", None)
+                pending_wl = st.session_state.pop("_pending_pick_well", None)
+                if pending_ev is not None:
+                    st.session_state["map_pick_event"] = pending_ev if pending_ev in event_options else ""
+                    st.session_state["map_pick_well"] = ""
+                if pending_wl is not None:
+                    st.session_state["map_pick_well"] = pending_wl if pending_wl in well_options else ""
+                    st.session_state["map_pick_event"] = ""
 
                 with col_ctrl:
                     picked_event = st.selectbox(
                         "Selected event (click map or choose here)",
                         [""] + event_options,
-                        index=0 if not st.session_state["map_selected_event"] else ([""] + event_options).index(str(st.session_state["map_selected_event"])) if str(st.session_state["map_selected_event"]) in event_options else 0,
                         key="map_pick_event",
                     )
                     picked_well = st.selectbox(
                         "Selected well (click map or choose here)",
                         [""] + well_options,
-                        index=0 if not st.session_state["map_selected_well"] else ([""] + well_options).index(str(st.session_state["map_selected_well"])) if str(st.session_state["map_selected_well"]) in well_options else 0,
                         key="map_pick_well",
                     )
                     if st.button("Clear selection", key="map_clear_sel"):
-                        st.session_state["map_selected_event"] = None
-                        st.session_state["map_selected_well"] = None
+                        # Queue widget-state resets for the next run (can't write to
+                        # widget keys after they were instantiated in this run).
+                        st.session_state["_pending_pick_event"] = ""
+                        st.session_state["_pending_pick_well"] = ""
+                        # Also drop the plotly widget's own selection state; otherwise
+                        # the previously clicked point re-fires the handler on rerun
+                        # and re-selects the cleared event/well immediately.
+                        st.session_state.pop("tx_basin_map", None)
                         st.rerun()
 
-                # Keep one active focus: event -> all linked wells on map; well -> all linked events.
+                # Dropdown widget values are the single source of truth. Dropping a
+                # selection to empty is treated as "no selection" — no extra wipe
+                # logic needed. When a dropdown is non-empty, prefer the *most
+                # recently changed* one (event over well when both somehow set).
+                show_ev: str | None = None
+                show_wl: str | None = None
                 if picked_event:
-                    st.session_state["map_selected_event"] = str(picked_event)
-                    st.session_state["map_selected_well"] = None
-                    picked_well = ""
+                    show_ev = str(picked_event)
                 elif picked_well:
-                    st.session_state["map_selected_well"] = str(picked_well)
-                    st.session_state["map_selected_event"] = None
-                    picked_event = ""
-                elif not picked_event and not picked_well:
-                    # User set both dropdowns to empty — drop any prior map selection.
-                    if st.session_state.get("map_selected_event") is not None or st.session_state.get("map_selected_well") is not None:
-                        st.session_state["map_selected_event"] = None
-                        st.session_state["map_selected_well"] = None
+                    show_wl = str(picked_well)
 
-                # Prefer session state so map clicks and dropdowns stay aligned after rerun.
-                show_ev = picked_event or st.session_state.get("map_selected_event")
-                show_wl = picked_well or st.session_state.get("map_selected_well")
-                if show_ev:
-                    show_ev, show_wl = str(show_ev), None
-                elif show_wl:
-                    show_wl, show_ev = str(show_wl), None
-                else:
-                    show_ev, show_wl = None, None
-
-                if show_ev:
-                    linked = links_df[links_df["EventID"].astype(str) == show_ev].copy()
-                    highlight_event_ids = {show_ev}
-                    highlight_well_ids = set(linked["api_number"].astype(str).tolist())
-                elif show_wl:
-                    linked = links_df[links_df["api_number"].astype(str) == show_wl].copy()
-                    highlight_event_ids = set(linked["EventID"].astype(str).tolist())
-                    highlight_well_ids = {show_wl}
+                # Use the normalized IDs (already on both sides) for matching.
+                show_ev_n = _norm_id(show_ev)
+                show_wl_n = _norm_id(show_wl)
+                if show_ev_n:
+                    linked = links_df[links_df["EventID"] == show_ev_n].copy()
+                    highlight_event_ids = {show_ev_n}
+                    highlight_well_ids = set(
+                        linked["api_number"].dropna().astype(str).tolist()
+                    )
+                elif show_wl_n:
+                    linked = links_df[links_df["api_number"] == show_wl_n].copy()
+                    highlight_event_ids = set(
+                        linked["EventID"].dropna().astype(str).tolist()
+                    )
+                    highlight_well_ids = {show_wl_n}
                 else:
                     linked = links_df.copy()
                     highlight_event_ids = set()
@@ -1286,24 +1348,24 @@ def main() -> None:
 
                 points_df["highlight_role"] = points_df["point_type"]
                 points_df.loc[
-                    points_df["point_type"].eq("Event") & points_df["EventID"].astype(str).isin(highlight_event_ids),
+                    points_df["point_type"].eq("Event") & points_df["EventID"].isin(highlight_event_ids),
                     "highlight_role",
                 ] = "Selected Event"
                 points_df.loc[
-                    points_df["point_type"].eq("Well") & points_df["api_number"].astype(str).isin(highlight_well_ids),
+                    points_df["point_type"].eq("Well") & points_df["api_number"].isin(highlight_well_ids),
                     "highlight_role",
                 ] = "Selected Well"
 
                 # Hide non-associated points once an event/well is selected.
-                if show_ev or show_wl:
+                if show_ev_n or show_wl_n:
                     points_plot = points_df[
                         (
                             points_df["point_type"].eq("Event")
-                            & points_df["EventID"].astype(str).isin(highlight_event_ids)
+                            & points_df["EventID"].isin(highlight_event_ids)
                         )
                         | (
                             points_df["point_type"].eq("Well")
-                            & points_df["api_number"].astype(str).isin(highlight_well_ids)
+                            & points_df["api_number"].isin(highlight_well_ids)
                         )
                     ].copy()
                 else:
@@ -1337,10 +1399,10 @@ def main() -> None:
                     hover_data={"EventID": True, "api_number": True, "metric_value": ":.3f", "marker_size": False, "highlight_role": False},
                     custom_data=["point_type", "EventID", "api_number"],
                     color_discrete_map={
-                        "Event": "#1e88e5",
-                        "Well": "#c62828",
-                        "Selected Event": "#00c853",
-                        "Selected Well": "#8e24aa",
+                        "Event": "#0072B2",          # blue (Okabe-Ito)
+                        "Well": "#D55E00",           # vermillion
+                        "Selected Event": "#009E73", # bluish green
+                        "Selected Well": "#CC79A7",  # reddish purple
                     },
                     zoom=5.2,
                     height=620,
@@ -1360,16 +1422,18 @@ def main() -> None:
                 if selected and selected.get("selection", {}).get("points"):
                     pt = selected["selection"]["points"][0]
                     p_type, ev_id, api = _parse_map_selection_point(pt)
+                    # Compare against the *current* widget state to decide whether
+                    # the click represents a new selection. We stash the target
+                    # value under `_pending_pick_*` so the sync block at the top
+                    # of the next run can assign it before the widget renders.
                     _changed = False
                     if p_type == "Event" and ev_id:
-                        if str(st.session_state.get("map_selected_event")) != str(ev_id) or st.session_state.get("map_selected_well") is not None:
-                            st.session_state["map_selected_event"] = str(ev_id)
-                            st.session_state["map_selected_well"] = None
+                        if st.session_state.get("map_pick_event", "") != ev_id:
+                            st.session_state["_pending_pick_event"] = ev_id
                             _changed = True
                     elif p_type == "Well" and api:
-                        if str(st.session_state.get("map_selected_well")) != str(api) or st.session_state.get("map_selected_event") is not None:
-                            st.session_state["map_selected_well"] = str(api)
-                            st.session_state["map_selected_event"] = None
+                        if st.session_state.get("map_pick_well", "") != api:
+                            st.session_state["_pending_pick_well"] = api
                             _changed = True
                     if _changed:
                         st.rerun()

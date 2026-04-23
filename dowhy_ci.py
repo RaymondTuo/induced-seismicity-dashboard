@@ -58,11 +58,39 @@ from sklearn.linear_model import Lasso
 # Importing here ensures the package is present and surfaces a clear ImportError
 # if econml is not installed, rather than a cryptic DoWhy failure later.
 try:
-    from econml.dml import NonParamDML  # noqa: F401
+    from econml.dml import LinearDML  # noqa: F401
     ECONML_AVAILABLE = True
 except ImportError:
     ECONML_AVAILABLE = False
 # --- END CHANGE 1: imports ---
+
+
+def _econml_ate(Y, T, W_confounders, model_y, model_t):
+    """Estimate ATE via LinearDML — nonlinear nuisance models, linear final stage.
+
+    DoWhy 0.14's EconML bridge (backdoor.econml.dml.NonParamDML) returns
+    near-identical values to OLS regardless of model_y/model_t because it does
+    not correctly wire the init_params through to the EconML estimator.
+    Calling LinearDML directly ensures GBM/RF/Lasso nuisance models are actually
+    used for residualization, producing genuinely model-specific causal estimates.
+
+    LinearDML is appropriate here because we want a single scalar ATE (comparable
+    to OLS's regression coefficient) rather than a heterogeneous CATE surface.
+    """
+    est = LinearDML(
+        model_y=copy.deepcopy(model_y),
+        model_t=copy.deepcopy(model_t),
+        discrete_treatment=False,
+        cv=3,
+        random_state=42,
+    )
+    est.fit(
+        Y=np.asarray(Y, dtype=float),
+        T=np.asarray(T, dtype=float),
+        X=None,
+        W=np.asarray(W_confounders, dtype=float),
+    )
+    return float(est.ate())
 
 
 # Suppress warnings for cleaner output
@@ -381,143 +409,108 @@ def calculate_mediation_effects_dowhy(data, model_config=None):
     uses_ols_pvalues = model_config["uses_ols_pvalues"]
 
     # -------------------------------------------------------------------------
-    # Step 1: Path a (W → P) using DoWhy
+    # Step 1: Path a (W → P)
     # -------------------------------------------------------------------------
     try:
-        dag_dot = nx.nx_pydot.to_pydot(G).to_string()
-        model_a_dowhy = CausalModel(data, treatment='W', outcome='P', graph=dag_dot)
-        estimand_a = model_a_dowhy.identify_effect()
-
-        # --- CHANGE 1: was hardcoded method_name="backdoor.linear_regression" ---
-        # estimate_a = model_a_dowhy.estimate_effect(
-        #     estimand_a,
-        #     method_name="backdoor.linear_regression",
-        #     control_value=0, treatment_value=1,
-        # )
-        estimate_a = model_a_dowhy.estimate_effect(
-            estimand_a,
-            method_name=estimator_method,
-            method_params=estimator_params,
-            control_value=0, treatment_value=1,
-        )
-        # --- END CHANGE 1 (path a estimate_effect call) ---
-
-        a_coef_dowhy = estimate_a.value
-
-        # CHANGE 1: OLS p-value extraction is only valid for the OLS baseline.
-        # For nonlinear models, a_pval is set to np.nan here and later derived
-        # from the bootstrap distribution in process_file().
         if uses_ols_pvalues:
+            # OLS baseline: use DoWhy + statsmodels for p-value
+            dag_dot = nx.nx_pydot.to_pydot(G).to_string()
+            model_a_dowhy = CausalModel(data, treatment='W', outcome='P', graph=dag_dot)
+            estimand_a = model_a_dowhy.identify_effect()
+            estimate_a = model_a_dowhy.estimate_effect(
+                estimand_a,
+                method_name=estimator_method,
+                method_params=estimator_params,
+                control_value=0, treatment_value=1,
+            )
+            a_coef_dowhy = estimate_a.value
             X_a = sm.add_constant(data[['W', 'G1', 'G2', P_MISSING_COL]])
             model_a_sm = fit_ols_stable(data['P'], X_a)
             a_pval = model_a_sm.pvalues['W']
         else:
-            # --- CHANGE 1: replaced sm.OLS p-value with np.nan for nonlinear models ---
-            # Original lines were:
-            #   X_a = sm.add_constant(data[['W', 'G1', 'G2', P_MISSING_COL]])
-            #   model_a_sm = sm.OLS(data['P'], X_a).fit()
-            #   a_pval = model_a_sm.pvalues['W']
+            # Non-OLS: call EconML LinearDML directly — bypasses DoWhy's broken bridge
+            init = estimator_params.get('init_params', {})
+            a_coef_dowhy = _econml_ate(
+                Y=data['P'].values,
+                T=data['W'].values,
+                W_confounders=data[['G1', 'G2', P_MISSING_COL]].values,
+                model_y=init['model_y'],
+                model_t=init['model_t'],
+            )
             a_pval = np.nan  # bootstrap p-value computed in process_file()
-            # --- END CHANGE 1 ---
-
     except Exception as e:
-        print(f"Warning: DoWhy path a estimation failed: {e}")
-        # Fallback to statsmodels OLS regardless of model_config
+        print(f"Warning: Path a estimation failed: {e}")
         model_a_sm = fit_ols_stable(data['P'], sm.add_constant(data[['W', 'G1', 'G2', P_MISSING_COL]]))
         a_coef_dowhy = model_a_sm.params['W']
         a_pval = model_a_sm.pvalues['W']
 
     # -------------------------------------------------------------------------
-    # Step 2: Path b (P → S | W) using DoWhy
+    # Step 2: Path b (P → S | W)
     # -------------------------------------------------------------------------
     try:
-        dag_dot = nx.nx_pydot.to_pydot(G).to_string()
-        model_b_dowhy = CausalModel(data, treatment='P', outcome='S', graph=dag_dot)
-        estimand_b = model_b_dowhy.identify_effect()
-
-        # --- CHANGE 1: was hardcoded method_name="backdoor.linear_regression" ---
-        # estimate_b = model_b_dowhy.estimate_effect(
-        #     estimand_b,
-        #     method_name="backdoor.linear_regression",
-        #     control_value=0, treatment_value=1,
-        # )
-        estimate_b = model_b_dowhy.estimate_effect(
-            estimand_b,
-            method_name=estimator_method,
-            method_params=copy.deepcopy(estimator_params),
-            control_value=0, treatment_value=1,
-        )
-        # --- END CHANGE 1 (path b estimate_effect call) ---
-
-        b_coef_dowhy = estimate_b.value
-
-        # CHANGE 1: same p-value logic as path a
         if uses_ols_pvalues:
+            dag_dot = nx.nx_pydot.to_pydot(G).to_string()
+            model_b_dowhy = CausalModel(data, treatment='P', outcome='S', graph=dag_dot)
+            estimand_b = model_b_dowhy.identify_effect()
+            estimate_b = model_b_dowhy.estimate_effect(
+                estimand_b,
+                method_name=estimator_method,
+                method_params=copy.deepcopy(estimator_params),
+                control_value=0, treatment_value=1,
+            )
+            b_coef_dowhy = estimate_b.value
             X_b = sm.add_constant(data[['P', 'W', 'G1', 'G2', P_MISSING_COL]])
             model_b_sm = fit_ols_stable(data['S'], X_b)
             b_pval = model_b_sm.pvalues['P']
         else:
-            # --- CHANGE 1: replaced sm.OLS p-value with np.nan for nonlinear models ---
-            # Original lines were:
-            #   X_b = sm.add_constant(data[['P', 'W', 'G1', 'G2', P_MISSING_COL]])
-            #   model_b_sm = sm.OLS(data['S'], X_b).fit()
-            #   b_pval = model_b_sm.pvalues['P']
-            b_pval = np.nan  # bootstrap p-value computed in process_file()
-            # --- END CHANGE 1 ---
-
+            # P → S controlling for W + confounders
+            init = estimator_params.get('init_params', {})
+            b_coef_dowhy = _econml_ate(
+                Y=data['S'].values,
+                T=data['P'].values,
+                W_confounders=data[['W', 'G1', 'G2', P_MISSING_COL]].values,
+                model_y=init['model_y'],
+                model_t=init['model_t'],
+            )
+            b_pval = np.nan
     except Exception as e:
-        print(f"Warning: DoWhy path b estimation failed: {e}")
-        # Fallback to statsmodels OLS regardless of model_config
+        print(f"Warning: Path b estimation failed: {e}")
         model_b_sm = fit_ols_stable(data['S'], sm.add_constant(data[['P', 'W', 'G1', 'G2', P_MISSING_COL]]))
         b_coef_dowhy = model_b_sm.params['P']
         b_pval = model_b_sm.pvalues['P']
 
     # -------------------------------------------------------------------------
-    # Step 3: Total effect (W → S) using DoWhy
+    # Step 3: Total effect (W → S)
     # -------------------------------------------------------------------------
     try:
-        dag_dot = nx.nx_pydot.to_pydot(G).to_string()
-        model_c_dowhy = CausalModel(data, treatment='W', outcome='S', graph=dag_dot)
-        estimand_c = model_c_dowhy.identify_effect()
-
-        # --- CHANGE 1: was hardcoded method_name="backdoor.linear_regression" ---
-        # estimate_c = model_c_dowhy.estimate_effect(
-        #     estimand_c,
-        #     method_name="backdoor.linear_regression",
-        #     control_value=0, treatment_value=1,
-        # )
-        estimate_c = model_c_dowhy.estimate_effect(
-            estimand_c,
-            method_name=estimator_method,
-            method_params=copy.deepcopy(estimator_params),
-            control_value=0, treatment_value=1,
-        )
-        # --- END CHANGE 1 (total effect estimate_effect call) ---
-
-        c_coef_dowhy = estimate_c.value
-
-        # CHANGE 1: OLS R² is only valid for the OLS baseline.
-        # For nonlinear models, model_c_r2 is set to np.nan. Change 2 will
-        # replace R² with proper nonlinear metrics (MAE, Skill Score, Spearman).
         if uses_ols_pvalues:
+            dag_dot = nx.nx_pydot.to_pydot(G).to_string()
+            model_c_dowhy = CausalModel(data, treatment='W', outcome='S', graph=dag_dot)
+            estimand_c = model_c_dowhy.identify_effect()
+            estimate_c = model_c_dowhy.estimate_effect(
+                estimand_c,
+                method_name=estimator_method,
+                method_params=copy.deepcopy(estimator_params),
+                control_value=0, treatment_value=1,
+            )
+            c_coef_dowhy = estimate_c.value
             X_c = sm.add_constant(data[['W', 'G1', 'G2', P_MISSING_COL]])
             model_c_sm = fit_ols_stable(data['S'], X_c)
             c_pval = model_c_sm.pvalues['W']
             model_c_r2 = model_c_sm.rsquared
         else:
-            # --- CHANGE 1: replaced sm.OLS p-value and R² for nonlinear models ---
-            # Original lines were:
-            #   X_c = sm.add_constant(data[['W', 'G1', 'G2', P_MISSING_COL]])
-            #   model_c_sm = sm.OLS(data['S'], X_c).fit()
-            #   c_pval = model_c_sm.pvalues['W']
-            #   model_c_r2 = model_c_sm.rsquared
-            c_pval = np.nan       # bootstrap p-value computed in process_file()
-            model_c_r2 = np.nan  # Change 2 will add proper nonlinear fit metrics
-            # --- END CHANGE 1 ---
-
+            init = estimator_params.get('init_params', {})
+            c_coef_dowhy = _econml_ate(
+                Y=data['S'].values,
+                T=data['W'].values,
+                W_confounders=data[['G1', 'G2', P_MISSING_COL]].values,
+                model_y=init['model_y'],
+                model_t=init['model_t'],
+            )
+            c_pval = np.nan
+            model_c_r2 = np.nan
     except Exception as e:
-        print(f"Warning: DoWhy total effect estimation failed: {e}")
-        # Fallback to statsmodels OLS regardless of model_config
+        print(f"Warning: Total effect estimation failed: {e}")
         model_c_sm = fit_ols_stable(data['S'], sm.add_constant(data[['W', 'G1', 'G2', P_MISSING_COL]]))
         c_coef_dowhy = model_c_sm.params['W']
         c_pval = model_c_sm.pvalues['W']
@@ -627,58 +620,78 @@ def run_dowhy_refutations(data, model_config=None):
         model_config = MODEL_CONFIGS["ols_baseline"]
 
     try:
-        pm = P_MISSING_COL
-        G = nx.DiGraph([
-            ('G1', 'W'), ('G1', 'P'), ('G1', 'S'), ('G1', pm),
-            ('G2', 'W'), ('G2', 'P'), ('G2', 'S'), ('G2', pm),
-            ('W', 'P'), ('P', 'S'), ('W', 'S'), ('W', pm),
-            (pm, 'S'),
-        ])
+        uses_ols = model_config["uses_ols_pvalues"]
 
-        dag_dot = nx.nx_pydot.to_pydot(G).to_string()
-        model = CausalModel(data, treatment='W', outcome='S', graph=dag_dot)
-        estimand = model.identify_effect()
+        if uses_ols:
+            # OLS baseline: use DoWhy's built-in refutation framework
+            pm = P_MISSING_COL
+            G = nx.DiGraph([
+                ('G1', 'W'), ('G1', 'P'), ('G1', 'S'), ('G1', pm),
+                ('G2', 'W'), ('G2', 'P'), ('G2', 'S'), ('G2', pm),
+                ('W', 'P'), ('P', 'S'), ('W', 'S'), ('W', pm),
+                (pm, 'S'),
+            ])
+            dag_dot = nx.nx_pydot.to_pydot(G).to_string()
+            model = CausalModel(data, treatment='W', outcome='S', graph=dag_dot)
+            estimand = model.identify_effect()
+            estimate = model.estimate_effect(
+                estimand,
+                method_name=model_config["method_name"],
+                method_params=copy.deepcopy(model_config["method_params"]),
+                control_value=0, treatment_value=1,
+            )
+            placebo_refute = model.refute_estimate(
+                estimand, estimate,
+                method_name="placebo_treatment_refuter",
+                placebo_type="permute"
+            )
+            subset_refute = model.refute_estimate(
+                estimand, estimate,
+                method_name="data_subset_refuter",
+                subset_fraction=0.8
+            )
+            return {
+                'placebo_effect': placebo_refute.new_effect,
+                'subset_effect': subset_refute.new_effect,
+                'original_effect': estimate.value,
+            }
+        else:
+            # Non-OLS: run refutations manually via _econml_ate
+            init = copy.deepcopy(model_config["method_params"].get("init_params", {}))
+            conf_cols = ['G1', 'G2', P_MISSING_COL]
 
-        # --- CHANGE 1: was hardcoded method_name="backdoor.linear_regression" ---
-        # estimate = model.estimate_effect(
-        #     estimand,
-        #     method_name="backdoor.linear_regression",
-        #     control_value=0, treatment_value=1,
-        # )
-        estimate = model.estimate_effect(
-            estimand,
-            method_name=model_config["method_name"],
-            method_params=copy.deepcopy(model_config["method_params"]),
-            control_value=0, treatment_value=1,
-        )
-        # --- END CHANGE 1 (refutation estimator) ---
+            original = _econml_ate(
+                data['S'].values, data['W'].values,
+                data[conf_cols].values, init['model_y'], init['model_t'],
+            )
 
-        # Placebo treatment refutation (unchanged)
-        placebo_refute = model.refute_estimate(
-            estimand, estimate,
-            method_name="placebo_treatment_refuter",
-            placebo_type="permute"
-        )
+            # Placebo: permute treatment
+            placebo_T = np.random.permutation(data['W'].values)
+            placebo_effect = _econml_ate(
+                data['S'].values, placebo_T,
+                data[conf_cols].values, init['model_y'], init['model_t'],
+            )
 
-        # Data subset refutation (unchanged)
-        subset_refute = model.refute_estimate(
-            estimand, estimate,
-            method_name="data_subset_refuter",
-            subset_fraction=0.8
-        )
+            # Subset: random 80% of data
+            idx = np.random.choice(len(data), size=int(0.8 * len(data)), replace=False)
+            sub = data.iloc[idx]
+            subset_effect = _econml_ate(
+                sub['S'].values, sub['W'].values,
+                sub[conf_cols].values, init['model_y'], init['model_t'],
+            )
 
-        return {
-            'placebo_effect': placebo_refute.new_effect,
-            'subset_effect': subset_refute.new_effect,
-            'original_effect': estimate.value
-        }
+            return {
+                'placebo_effect': placebo_effect,
+                'subset_effect': subset_effect,
+                'original_effect': original,
+            }
 
     except Exception as e:
-        print(f"Warning: DoWhy refutations failed: {e}")
+        print(f"Warning: Refutations failed: {e}")
         return {
             'placebo_effect': np.nan,
             'subset_effect': np.nan,
-            'original_effect': np.nan
+            'original_effect': np.nan,
         }
 
 
